@@ -516,6 +516,19 @@ router.put('/entry/:entryId', async (req, res) => {
       chequeNo
     } = req.body;
 
+    // Fetch the current entry BEFORE update to compare status
+    const [currentRows] = await connection.query(
+      `SELECT * FROM ledger_entries WHERE entry_id = ?`,
+      [entryId]
+    );
+    if (currentRows.length === 0) {
+      return res.status(404).json({ error: 'Ledger entry not found' });
+    }
+    const currentEntry = currentRows[0];
+    const wasUnpaid = currentEntry.status !== 'paid' && currentEntry.status !== 'Paid';
+    const becomingPaid = status === 'paid' || status === 'Paid';
+    const isDebitEntry = parseFloat(currentEntry.debit_amount) > 0 && parseFloat(currentEntry.credit_amount) === 0;
+
     // Update main entry
     await connection.query(
       `UPDATE ledger_entries 
@@ -530,6 +543,121 @@ router.put('/entry/:entryId', async (req, res) => {
         entryId
       ]
     );
+
+    // If a DEBIT entry just became 'paid', auto-create CREDIT payment entry
+    // (mirrors how the invoice system works)
+    if (wasUnpaid && becomingPaid && isDebitEntry) {
+      const customerId = currentEntry.customer_id;
+      const billNo = currentEntry.bill_no;
+      const entryDate = currentEntry.entry_date;
+      const debitAmount = parseFloat(currentEntry.debit_amount) || 0;
+
+      // Check if a credit payment entry already exists for this bill
+      const [existingPayment] = await connection.query(
+        `SELECT entry_id FROM ledger_entries 
+         WHERE customer_id = ? AND bill_no = ? AND credit_amount > 0`,
+        [customerId, billNo]
+      );
+
+      if (!existingPayment || existingPayment.length === 0) {
+        // Calculate running balance BEFORE adding payment
+        const [balRes] = await connection.query(
+          `SELECT COALESCE(SUM(debit_amount - credit_amount), 0) as currentBalance
+           FROM ledger_entries WHERE customer_id = ?`,
+          [customerId]
+        );
+        const currentBalance = Number(balRes[0].currentBalance) || 0;
+        const paymentBalance = currentBalance - debitAmount;
+
+        const [seqRes] = await connection.query(
+          `SELECT COALESCE(MAX(sequence), 0) + 1 as next_seq
+           FROM ledger_entries WHERE customer_id = ? AND entry_date = ?`,
+          [customerId, entryDate]
+        );
+        const paySeq = Number(seqRes[0].next_seq) || 1;
+
+        const _hasEntryTypePut = await hasEntryTypeColumn();
+        if (_hasEntryTypePut) {
+          await connection.query(
+            `INSERT INTO ledger_entries
+             (customer_id, entry_date, description, bill_no, entry_type, payment_mode,
+              debit_amount, credit_amount, balance, status, has_multiple_items, sequence)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [customerId, entryDate, 'Payment Received', billNo, 'payment',
+             paymentMode || currentEntry.payment_mode || 'Cash',
+             0, debitAmount, paymentBalance, 'paid', 0, paySeq]
+          );
+        } else {
+          await connection.query(
+            `INSERT INTO ledger_entries
+             (customer_id, entry_date, description, bill_no, payment_mode,
+              debit_amount, credit_amount, balance, status, has_multiple_items, sequence)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [customerId, entryDate, 'Payment Received', billNo,
+             paymentMode || currentEntry.payment_mode || 'Cash',
+             0, debitAmount, paymentBalance, 'paid', 0, paySeq]
+          );
+        }
+
+        // If a tax DEBIT entry exists for this bill, also create CREDIT tax payment and update its status
+        const taxBillNo = billNo ? `TAX-${billNo}` : null;
+        if (taxBillNo) {
+          const [taxRows] = await connection.query(
+            `SELECT * FROM ledger_entries WHERE customer_id = ? AND bill_no = ? AND debit_amount > 0`,
+            [customerId, taxBillNo]
+          );
+
+          if (taxRows.length > 0) {
+            const taxEntry = taxRows[0];
+            const taxAmount = parseFloat(taxEntry.debit_amount) || 0;
+
+            // Update tax entry status to paid
+            await connection.query(
+              `UPDATE ledger_entries SET status = 'paid' WHERE entry_id = ?`,
+              [taxEntry.entry_id]
+            );
+
+            // Check no credit tax payment already exists
+            const [existingTaxPay] = await connection.query(
+              `SELECT entry_id FROM ledger_entries WHERE customer_id = ? AND bill_no = ? AND credit_amount > 0`,
+              [customerId, taxBillNo]
+            );
+
+            if (!existingTaxPay || existingTaxPay.length === 0) {
+              const taxBalance = paymentBalance - taxAmount;
+              const [taxSeqRes] = await connection.query(
+                `SELECT COALESCE(MAX(sequence), 0) + 1 as next_seq
+                 FROM ledger_entries WHERE customer_id = ? AND entry_date = ?`,
+                [customerId, entryDate]
+              );
+              const taxPaySeq = Number(taxSeqRes[0].next_seq) || 1;
+
+              if (_hasEntryTypePut) {
+                await connection.query(
+                  `INSERT INTO ledger_entries
+                   (customer_id, entry_date, description, bill_no, entry_type, payment_mode,
+                    debit_amount, credit_amount, balance, status, has_multiple_items, sequence)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                  [customerId, entryDate, `Tax Payment`, taxBillNo, 'payment_tax',
+                   paymentMode || currentEntry.payment_mode || 'Cash',
+                   0, taxAmount, taxBalance, 'paid', 0, taxPaySeq]
+                );
+              } else {
+                await connection.query(
+                  `INSERT INTO ledger_entries
+                   (customer_id, entry_date, description, bill_no, payment_mode,
+                    debit_amount, credit_amount, balance, status, has_multiple_items, sequence)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                  [customerId, entryDate, `Tax Payment`, taxBillNo,
+                   paymentMode || currentEntry.payment_mode || 'Cash',
+                   0, taxAmount, taxBalance, 'paid', 0, taxPaySeq]
+                );
+              }
+            }
+          }
+        }
+      }
+    }
 
     await connection.commit();
 
@@ -632,6 +760,16 @@ router.post('/customer/:customerId/bulk', async (req, res) => {
 
     const createdEntries = [];
 
+    // Calculate the true running balance for this customer ONCE before the loop
+    // Use SUM(debit - credit) — correct running total, not MAX(balance) which is wrong
+    const [initBalResult] = await connection.query(
+      `SELECT COALESCE(SUM(debit_amount - credit_amount), 0) as currentBalance
+       FROM ledger_entries
+       WHERE customer_id = ?`,
+      [customerId]
+    );
+    let runningBalance = Number(initBalResult[0].currentBalance) || 0;
+
     // Process all entries in sequence
     for (let entryData of entriesToAdd) {
       const {
@@ -662,19 +800,11 @@ router.post('/customer/:customerId/bulk', async (req, res) => {
         throw new Error('Either debit or credit amount is required');
       }
 
-      // Get the previous balance (latest balance in the sequence)
-      const [balanceResult] = await connection.query(
-        `SELECT COALESCE(MAX(balance), 0) as lastBalance 
-         FROM ledger_entries 
-         WHERE customer_id = ?`,
-        [customerId]
-      );
-      const previousBalance = Number(balanceResult[0].lastBalance) || 0;
-      
-      // Calculate new balance
+      // Calculate new balance using running total (updated after each insert)
       const debit = Number(debitAmount) || 0;
       const credit = Number(creditAmount) || 0;
-      const newBalance = Number(previousBalance) + Number(debit) - Number(credit);
+      const newBalance = runningBalance + debit - credit;
+      runningBalance = newBalance; // maintain for next entry in this batch
       
       if (!Number.isFinite(newBalance)) {
         throw new Error('Invalid balance calculation');

@@ -53,14 +53,16 @@ const GeneralLedger = () => {
     paymentMode: 'Cash',
     chequeNo: '',
     entryType: 'debit', // 'debit' or 'credit'
-    salesTaxRate: 0
+    salesTaxRate: 0,
+    isPaid: true, // true = create both invoice+payment; false = invoice (pending) only
   });
 
   // New state for line items (structured approach)
   const [lineItems, setLineItems] = useState([
-    { id: 1, description: '', quantity: 0, rate: 0, type: 'material', amount: 0 }
+    { id: 1, description: '', quantity: 0, rate: 0, type: 'material', amount: 0, taxRate: 0 }
   ]);
   const [useLineItems, setUseLineItems] = useState(false); // Toggle between old and new approach
+  const [pendingMatchEntry, setPendingMatchEntry] = useState(null); // Pending debit entry matched by Bill #
   const location = useLocation();
   const navigate = useNavigate();
 
@@ -96,22 +98,6 @@ const GeneralLedger = () => {
   }, []);
 
 
-
-  // --- Dummy data (no backend connection) ---
-  const dummyCustomers = [
-    { customer_id: 1, customer_name: 'Ali Khan' },
-    { customer_id: 2, customer_name: 'Sara Ahmed' },
-    { customer_id: 3, customer_name: 'Bilal Hussain' },
-    { customer_id: 4, customer_name: 'Fatima R.' },
-  ];
-
-  const dummyLedgerEntries = [
-    { date: '2025-10-01', particulars: 'Invoice Sale', description: 'Sold 120 MTR of cotton fabric', mtr: 120, rate: 250, billNo: 'INV-1001', cash: 5000, online: 0, cheque: 0, debit: 30000, credit: 5000, balance: 25000, days: 10, dueDate: '2025-10-31' },
-    { date: '2025-10-12', particulars: 'Payment Received', description: 'Online transfer from customer', mtr: null, rate: null, billNo: null, cash: 0, online: 5000, cheque: 0, debit: 0, credit: 5000, balance: 20000, days: 5, dueDate: '2025-11-01' },
-    { date: '2025-10-20', particulars: 'Invoice Sale', description: 'Sold 50 MTR of silk fabric', mtr: 50, rate: 260, billNo: 'INV-1010', cash: 0, online: 0, cheque: 10000, debit: 13000, credit: 0, balance: 33000, days: 35, dueDate: '2025-11-20' },
-    { date: '2025-10-28', particulars: 'Cheque Deposit', description: 'Cheque deposited for INV-1010', mtr: null, rate: null, billNo: null, cash: 0, online: 0, cheque: 8000, debit: 0, credit: 8000, balance: 25000, days: 2, dueDate: '2025-11-05' },
-    { date: '2025-11-01', particulars: 'Opening Balance Adj', description: 'Adjustment entry', mtr: null, rate: null, billNo: null, cash: 0, online: 0, cheque: 0, debit: 0, credit: 0, balance: 25000, days: null, dueDate: null },
-  ];
   // -------------------------------------------
 
   // Fetch customers and ledger data from backend
@@ -252,6 +238,78 @@ const GeneralLedger = () => {
 
   // No need to save to localStorage - all data comes from database
 
+  // Lookup existing pending debit entry for a given Bill #
+  const lookupPendingEntry = (billNo) => {
+    if (!billNo || !String(billNo).trim()) {
+      setPendingMatchEntry(null);
+      return;
+    }
+    const entries = ledgerData[activeTab] || [];
+    const match = entries.find(entry => {
+      const entryBillNo = String(entry.billNo || entry.bill_no || '').trim();
+      const debit = parseFloat(entry.debit) || parseFloat(entry.debit_amount) || 0;
+      const credit = parseFloat(entry.credit) || parseFloat(entry.credit_amount) || 0;
+      const status = String(entry.status || '').toLowerCase();
+      return (
+        entryBillNo === String(billNo).trim() &&
+        debit > 0 &&
+        credit === 0 &&
+        status !== 'paid' &&
+        entry.entry_id
+      );
+    });
+    setPendingMatchEntry(match || null);
+  };
+
+  // Mark a pending debit entry as paid by updating its status (backend auto-creates credit entry)
+  const handleMarkAsPaid = async () => {
+    if (!pendingMatchEntry || !pendingMatchEntry.entry_id) {
+      alert('No pending invoice found to mark as paid.');
+      return;
+    }
+    try {
+      const response = await fetch(
+        `${process.env.REACT_APP_API_BASE_URL || 'http://localhost:5000/api'}/ledger-entries/entry/${pendingMatchEntry.entry_id}`,
+        {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            description: pendingMatchEntry.particulars || pendingMatchEntry.description || '',
+            status: 'paid',
+            dueDate: pendingMatchEntry.dueDate || null,
+            paymentMode: newEntry.paymentMode || 'Cash',
+            chequeNo: newEntry.chequeNo || null
+          })
+        }
+      );
+      if (!response.ok) {
+        const errData = await response.json().catch(() => ({}));
+        throw new Error(errData.error || 'Failed to mark as paid');
+      }
+      alert('✅ Invoice marked as paid! A credit entry has been created automatically.');
+      setPendingMatchEntry(null);
+      setNewEntry({
+        date: '',
+        particulars: '',
+        description: '',
+        mtr: '',
+        rate: '',
+        billNo: '',
+        paymentMode: 'Cash',
+        chequeNo: '',
+        entryType: 'debit',
+        salesTaxRate: 0,
+        isPaid: true,
+      });
+      setLineItems([{ id: 1, description: '', quantity: 0, rate: 0, type: 'material', amount: 0, taxRate: 0 }]);
+      setShowAddModal(false);
+      setTimeout(() => window.location.reload(), 500);
+    } catch (err) {
+      console.error('[GeneralLedger] ❌ Error marking as paid:', err);
+      alert(`⚠️ Error: ${err.message}`);
+    }
+  };
+
   // Handle Add Entry submission
   const handleAddEntry = async () => {
     // Basic required fields
@@ -264,9 +322,13 @@ const GeneralLedger = () => {
     const isDebit = newEntry.entryType === 'debit';
     const salesTaxRate = parseFloat(newEntry.salesTaxRate) || 0;
 
-    // Get current ledger data and calculate previous balance
-    const currentEntries = ledgerData[activeTab] || [];
-    const previousBalance = currentEntries.length > 0 ? (parseFloat(currentEntries[currentEntries.length - 1].balance) || 0) : 0;
+    // isPaidTx: CREDIT entries always create both sides; DEBIT entries create both only when isPaid=true
+    const isPaidTx = !isDebit || newEntry.isPaid !== false;
+
+    // Common fields
+    const billNo = newEntry.billNo || null;
+    const taxBillNo = billNo ? `TAX-${billNo}` : null;
+    const entryDesc = newEntry.description || billNo || `Entry-${Date.now()}`;
 
     if (useLineItems) {
       // Validate line items
@@ -293,57 +355,119 @@ const GeneralLedger = () => {
 
       // Compute totals from line items
       const totalFromItems = getLineItemsTotal();
-      const salesTaxAmount = (totalFromItems * salesTaxRate) / 100;
+      // In multi-item mode tax is per-line-item, not from global salesTaxRate
+      const salesTaxAmount = lineItems.reduce((sum, item) => {
+        const amt = item.amount || ((Number(item.quantity) || 0) * (Number(item.rate) || 0));
+        return sum + amt * (Number(item.taxRate) || 0) / 100;
+      }, 0);
+      // Effective display rate (blended) for the tax entry label
+      const effectiveTaxRate = totalFromItems > 0 ? Math.round(salesTaxAmount / totalFromItems * 1000) / 10 : 0;
       const materialAmount = totalFromItems;
 
-      const materialBalance = previousBalance + (isDebit ? materialAmount : -materialAmount);
+      // Derive description from line items when no overall description is provided
+      const multiItemSummary = lineItems.length === 1
+        ? lineItems[0].description
+        : lineItems.map(it => String(it.description || '').trim()).filter(Boolean).join(' | ');
+      const itemsEntryDesc = newEntry.description || multiItemSummary || billNo || `Entry-${Date.now()}`;
 
-      const mainEntry = {
+      // 1. DEBIT entry (Invoice/Sale) — always created
+      const debitDesc = isDebit ? itemsEntryDesc : `Invoice - ${itemsEntryDesc}`;
+      entriesToAdd.push({
         date: newEntry.date,
-        particulars: newEntry.description || newEntry.billNo || `Entry-${new Date().getTime()}`,
-        description: newEntry.description || null,
+        particulars: debitDesc,
+        description: debitDesc,
         itemsDetails: serializeLineItems(),
         mtr: null,
         rate: null,
-        billNo: newEntry.billNo || null,
-        cash: newEntry.paymentMode === 'Cash' ? materialAmount : 0,
-        online: newEntry.paymentMode === 'Online' ? materialAmount : 0,
-        cheque: newEntry.paymentMode === 'Cheque' ? materialAmount : 0,
+        billNo: billNo,
+        cash: 0, online: 0, cheque: 0,
         chequeNo: newEntry.chequeNo || null,
-        debit: isDebit ? materialAmount : 0,
-        credit: isDebit ? 0 : materialAmount,
-        balance: materialBalance,
+        debit: materialAmount,
+        credit: 0,
+        balance: 0,
         days: 0,
         dueDate: null,
         has_multiple_items: true,
-        isManualEntry: true
-      };
+        isManualEntry: true,
+        _isTaxEntry: false,
+        _hasLineItems: true,
+      });
 
-      entriesToAdd.push(mainEntry);
-
-      // Add tax entry if tax rate > 0
-      if (salesTaxRate > 0) {
-        const taxBalance = materialBalance + (isDebit ? salesTaxAmount : -salesTaxAmount);
+      // 2. CREDIT entry (Payment Received) — created only when isPaidTx
+      if (isPaidTx) {
+        const creditDesc = isDebit ? 'Payment Received' : itemsEntryDesc;
         entriesToAdd.push({
           date: newEntry.date,
-          particulars: `Sales Tax @ ${salesTaxRate}%`,
-          description: `${salesTaxRate}% sales tax on invoice`,
+          particulars: creditDesc,
+          description: creditDesc,
           itemsDetails: null,
           mtr: null,
           rate: null,
-          billNo: newEntry.billNo ? `TAX-${newEntry.billNo}` : 'TAX',
-          cash: 0,
-          online: 0,
-          cheque: 0,
-          chequeNo: null,
-          debit: isDebit ? salesTaxAmount : 0,
-          credit: isDebit ? 0 : salesTaxAmount,
-          balance: taxBalance,
+          billNo: billNo,
+          cash: newEntry.paymentMode === 'Cash' ? materialAmount : 0,
+          online: newEntry.paymentMode === 'Online' ? materialAmount : 0,
+          cheque: newEntry.paymentMode === 'Cheque' ? materialAmount : 0,
+          chequeNo: newEntry.chequeNo || null,
+          debit: 0,
+          credit: materialAmount,
+          balance: 0,
           days: 0,
           dueDate: null,
           has_multiple_items: false,
-          isManualEntry: true
+          isManualEntry: true,
+          _isTaxEntry: false,
+          _hasLineItems: false,
         });
+      }
+
+      // 3 & 4. Tax entries — if any line item has tax
+      if (salesTaxAmount > 0) {
+        const taxLabel = effectiveTaxRate > 0 ? `Sales Tax @ ${effectiveTaxRate}%` : 'Sales Tax';
+        const taxPayLabel = effectiveTaxRate > 0 ? `Tax Payment @ ${effectiveTaxRate}%` : 'Tax Payment';
+        // DEBIT tax (always when tax exists)
+        entriesToAdd.push({
+          date: newEntry.date,
+          particulars: taxLabel,
+          description: taxLabel,
+          itemsDetails: null,
+          mtr: null,
+          rate: null,
+          billNo: taxBillNo,
+          cash: 0, online: 0, cheque: 0,
+          chequeNo: null,
+          debit: salesTaxAmount,
+          credit: 0,
+          balance: 0,
+          days: 0,
+          dueDate: null,
+          has_multiple_items: false,
+          isManualEntry: true,
+          _isTaxEntry: true,
+          _hasLineItems: false,
+        });
+        // CREDIT tax payment — only when isPaidTx
+        if (isPaidTx) {
+          entriesToAdd.push({
+            date: newEntry.date,
+            particulars: taxPayLabel,
+            description: taxPayLabel,
+            itemsDetails: null,
+            mtr: null,
+            rate: null,
+            billNo: taxBillNo,
+            cash: 0, online: 0, cheque: 0,
+            chequeNo: null,
+            debit: 0,
+            credit: salesTaxAmount,
+            balance: 0,
+            days: 0,
+            dueDate: null,
+            has_multiple_items: false,
+            isManualEntry: true,
+            _isTaxEntry: true,
+            _hasLineItems: false,
+          });
+        }
       }
 
     } else {
@@ -361,52 +485,98 @@ const GeneralLedger = () => {
       const materialAmount = (Number(newEntry.mtr) || 0) * (Number(newEntry.rate) || 0);
       const salesTaxAmount = (materialAmount * salesTaxRate) / 100;
 
-      const materialBalance = previousBalance + (isDebit ? materialAmount : -materialAmount);
-
-      const mainEntry = {
+      // 1. DEBIT entry (Invoice/Sale) — always created
+      const debitDesc = isDebit ? entryDesc : `Invoice - ${entryDesc}`;
+      entriesToAdd.push({
         date: newEntry.date,
-        particulars: newEntry.description || newEntry.billNo || `Entry-${new Date().getTime()}`,
-        description: newEntry.description || null,
+        particulars: debitDesc,
+        description: debitDesc,
         mtr: Number(newEntry.mtr),
         rate: Number(newEntry.rate),
-        billNo: newEntry.billNo || null,
-        cash: newEntry.paymentMode === 'Cash' ? materialAmount : 0,
-        online: newEntry.paymentMode === 'Online' ? materialAmount : 0,
-        cheque: newEntry.paymentMode === 'Cheque' ? materialAmount : 0,
+        billNo: billNo,
+        cash: 0, online: 0, cheque: 0,
         chequeNo: newEntry.chequeNo || null,
-        debit: isDebit ? materialAmount : 0,
-        credit: isDebit ? 0 : materialAmount,
-        balance: materialBalance,
+        debit: materialAmount,
+        credit: 0,
+        balance: 0,
         days: 0,
         dueDate: null,
         has_multiple_items: false,
-        isManualEntry: true
-      };
+        isManualEntry: true,
+        _isTaxEntry: false,
+        _hasLineItems: false,
+      });
 
-      entriesToAdd.push(mainEntry);
-
-      // Add tax entry if tax rate > 0
-      if (salesTaxRate > 0) {
-        const taxBalance = materialBalance + (isDebit ? salesTaxAmount : -salesTaxAmount);
+      // 2. CREDIT entry (Payment Received) — created only when isPaidTx
+      if (isPaidTx) {
+        const creditDesc = isDebit ? 'Payment Received' : entryDesc;
         entriesToAdd.push({
           date: newEntry.date,
-          particulars: `Sales Tax @ ${salesTaxRate}%`,
-          description: `${salesTaxRate}% sales tax on material`,
+          particulars: creditDesc,
+          description: creditDesc,
           mtr: null,
           rate: null,
-          billNo: newEntry.billNo ? `TAX-${newEntry.billNo}` : 'TAX',
-          cash: 0,
-          online: 0,
-          cheque: 0,
-          chequeNo: null,
-          debit: isDebit ? salesTaxAmount : 0,
-          credit: isDebit ? 0 : salesTaxAmount,
-          balance: taxBalance,
+          billNo: billNo,
+          cash: newEntry.paymentMode === 'Cash' ? materialAmount : 0,
+          online: newEntry.paymentMode === 'Online' ? materialAmount : 0,
+          cheque: newEntry.paymentMode === 'Cheque' ? materialAmount : 0,
+          chequeNo: newEntry.chequeNo || null,
+          debit: 0,
+          credit: materialAmount,
+          balance: 0,
           days: 0,
           dueDate: null,
           has_multiple_items: false,
-          isManualEntry: true
+          isManualEntry: true,
+          _isTaxEntry: false,
+          _hasLineItems: false,
         });
+      }
+
+      // 3 & 4. Tax entries — if tax applied
+      if (salesTaxRate > 0) {
+        // DEBIT tax (always when tax exists)
+        entriesToAdd.push({
+          date: newEntry.date,
+          particulars: `Sales Tax @ ${salesTaxRate}%`,
+          description: `Sales Tax @ ${salesTaxRate}%`,
+          mtr: null,
+          rate: null,
+          billNo: taxBillNo,
+          cash: 0, online: 0, cheque: 0,
+          chequeNo: null,
+          debit: salesTaxAmount,
+          credit: 0,
+          balance: 0,
+          days: 0,
+          dueDate: null,
+          has_multiple_items: false,
+          isManualEntry: true,
+          _isTaxEntry: true,
+          _hasLineItems: false,
+        });
+        // CREDIT tax payment — only when isPaidTx
+        if (isPaidTx) {
+          entriesToAdd.push({
+            date: newEntry.date,
+            particulars: `Tax Payment @ ${salesTaxRate}%`,
+            description: `Tax Payment @ ${salesTaxRate}%`,
+            mtr: null,
+            rate: null,
+            billNo: taxBillNo,
+            cash: 0, online: 0, cheque: 0,
+            chequeNo: null,
+            debit: 0,
+            credit: salesTaxAmount,
+            balance: 0,
+            days: 0,
+            dueDate: null,
+            has_multiple_items: false,
+            isManualEntry: true,
+            _isTaxEntry: true,
+            _hasLineItems: false,
+          });
+        }
       }
     }
 
@@ -414,21 +584,21 @@ const GeneralLedger = () => {
     try {
       console.log('[GeneralLedger] Saving entries to backend:', entriesToAdd);
       
-      // Send BOTH entries (material + tax) in a SINGLE request to backend
-      // This ensures they're created in a transaction and sequence is handled properly
+      // Build the payload — all entries are explicit (no server-side auto tax creation)
       const entriesToPost = entriesToAdd.map(entry => {
-        // Prepare line items for backend if using line items mode
-        let backendLineItems = [];
-        if (useLineItems && !entry.particulars.includes('Sales Tax')) {
-          // Only send line items for the main entry, not the tax entry
-          backendLineItems = lineItems.map(item => ({
-            description: item.description,
-            quantity: Number(item.quantity) || 0,
-            rate: Number(item.rate) || 0,
-            type: item.type || 'material',
-            taxRate: Number(item.taxRate) || 0
-          }));
-        }
+        const isTaxEntry = entry._isTaxEntry === true;
+        const hasLineItemsEntry = entry._hasLineItems === true;
+
+        // Send line items only for the main debit entry (invoice)
+        const backendLineItems = (useLineItems && hasLineItemsEntry)
+          ? lineItems.map(item => ({
+              description: item.description,
+              quantity: Number(item.quantity) || 0,
+              rate: Number(item.rate) || 0,
+              type: item.type || 'material',
+              taxRate: Number(item.taxRate) || 0
+            }))
+          : [];
 
         return {
           entryDate: entry.date,
@@ -439,16 +609,15 @@ const GeneralLedger = () => {
           debitAmount: entry.debit,
           creditAmount: entry.credit,
           dueDate: entry.dueDate,
-          status: 'paid',
-          salesTaxRate: entry.particulars.includes('Sales Tax') ? 0 : (useLineItems ? 0 : parseFloat(newEntry.salesTaxRate) || 0),
-          salesTaxAmount: entry.particulars.includes('Sales Tax') ? entry.debit : 0,  // For tax entries, use debit amount (tax value)
-          useLineItems: useLineItems && !entry.particulars.includes('Sales Tax'),
+          // Pending status only for a lone debit invoice (isDebit + not isPaid)
+          status: (entry.credit > 0 || isPaidTx) ? 'paid' : 'unpaid',
+          salesTaxRate: isTaxEntry ? 0 : (parseFloat(newEntry.salesTaxRate) || 0),
+          salesTaxAmount: 0,  // all entries are explicit; disable server auto-tax
+          useLineItems: !!(useLineItems && hasLineItemsEntry),
           mtr: entry.mtr,
           rate: entry.rate,
-          isTaxEntry: entry.particulars.includes('Sales Tax'),  // Flag to indicate this IS a tax entry
+          isTaxEntry: isTaxEntry,
           lineItems: backendLineItems.length > 0 ? backendLineItems : undefined,
-          isMainEntry: !entry.particulars.includes('Sales Tax'),  // Flag to identify main vs tax entry
-          isTaxEntry: entry.particulars.includes('Sales Tax')     // Flag to identify tax entry
         };
       });
 
@@ -508,11 +677,13 @@ const GeneralLedger = () => {
       paymentMode: 'Cash',
       chequeNo: '',
       entryType: 'debit',
-      salesTaxRate: 0
+      salesTaxRate: 0,
+      isPaid: true,
     });
 
     // Reset line items when leaving modal
-    setLineItems([{ id: 1, description: '', quantity: 0, rate: 0, type: 'material', amount: 0 }]);
+    setLineItems([{ id: 1, description: '', quantity: 0, rate: 0, type: 'material', amount: 0, taxRate: 0 }]);
+    setPendingMatchEntry(null);
     setShowAddModal(false);
 
     // Auto-refresh ledger data after 500ms to show the new entry
@@ -652,7 +823,7 @@ const GeneralLedger = () => {
     const newId = Math.max(...lineItems.map(item => item.id || 0), 0) + 1;
     setLineItems([
       ...lineItems,
-      { id: newId, description: '', quantity: 0, rate: 0, type: 'material', amount: 0 }
+      { id: newId, description: '', quantity: 0, rate: 0, type: 'material', amount: 0, taxRate: 0 }
     ]);
   };
 
@@ -1436,7 +1607,7 @@ const GeneralLedger = () => {
                   <p className="text-slate-400 text-sm mt-1">Record a new transaction</p>
                 </div>
                 <button
-                  onClick={() => setShowAddModal(false)}
+                  onClick={() => { setShowAddModal(false); setPendingMatchEntry(null); }}
                   className="w-9 h-9 rounded-lg bg-slate-700 hover:bg-slate-600 flex items-center justify-center text-slate-300 hover:text-white transition-all"
                 >
                   <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -1497,7 +1668,6 @@ const GeneralLedger = () => {
                         onChange={(e) => setNewEntry({ ...newEntry, date: e.target.value })}
                         className="w-full px-4 py-2.5 rounded-lg border border-slate-300 focus:border-blue-500 focus:ring-2 focus:ring-blue-100 transition-all font-medium text-slate-900 bg-white"
                       />
-                      
                     </div>
                     <div>
                       <label className="block text-sm font-semibold text-slate-700 mb-2">Bill #</label>
@@ -1505,29 +1675,40 @@ const GeneralLedger = () => {
                         type="text"
                         placeholder="INV-1001"
                         value={newEntry.billNo}
-                        onChange={(e) => setNewEntry({ ...newEntry, billNo: e.target.value })}
+                        onChange={(e) => {
+                          setNewEntry({ ...newEntry, billNo: e.target.value });
+                          lookupPendingEntry(e.target.value);
+                        }}
                         className="w-full px-4 py-2.5 rounded-lg border border-slate-300 focus:border-blue-500 focus:ring-2 focus:ring-blue-100 transition-all font-medium text-slate-900 bg-white placeholder-slate-400"
                       />
                     </div>
                   </div>
+                  {/* Pending Invoice Match Banner */}
+                  {pendingMatchEntry && (
+                    <div className="mt-4 p-4 bg-amber-50 border border-amber-300 rounded-lg">
+                      <div className="flex items-start gap-3">
+                        <svg className="w-5 h-5 text-amber-600 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                        </svg>
+                        <div className="flex-1">
+                          <p className="font-semibold text-amber-800 text-sm">Pending Invoice Found</p>
+                          <p className="text-amber-700 text-xs mt-1">
+                            Bill # <strong>{pendingMatchEntry.billNo || pendingMatchEntry.bill_no}</strong> &mdash; Amount: <strong>{formatCurrency(parseFloat(pendingMatchEntry.debit) || parseFloat(pendingMatchEntry.debit_amount) || 0)}</strong> &mdash; Date: {formatDate(pendingMatchEntry.date)}
+                          </p>
+                          <p className="text-amber-600 text-xs mt-0.5">{pendingMatchEntry.particulars || pendingMatchEntry.description || 'Pending Invoice'}</p>
+                          <p className="text-amber-700 text-xs mt-2 font-medium">
+                            ✨ Use the <strong>"Mark as Paid"</strong> button below to settle this invoice. A credit entry will be created automatically.
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+                  )}
                 </div>
 
                 {/* Mode-Specific Content */}
                 {useLineItems ? (
                   // Multiple Items Section
                   <div className="mb-6">
-                    {/* Bill # Field for Multiple Items */}
-                    <div className="mb-4 p-4 bg-slate-50 rounded-lg border border-slate-200">
-                      <label className="block text-sm font-semibold text-slate-700 mb-2">Bill #</label>
-                      <input
-                        type="text"
-                        placeholder="INV-1001"
-                        value={newEntry.billNo}
-                        onChange={(e) => setNewEntry({ ...newEntry, billNo: e.target.value })}
-                        className="w-full px-4 py-2.5 rounded-lg border border-slate-300 focus:border-blue-500 focus:ring-2 focus:ring-blue-100 transition-all font-medium text-slate-900 bg-white"
-                      />
-                    </div>
-
                     <div className="flex items-center justify-between mb-4">
                       <div>
                         <h3 className="text-sm font-bold text-slate-900 uppercase tracking-wider">Line Items</h3>
@@ -1541,6 +1722,20 @@ const GeneralLedger = () => {
                         </svg>
                         Add Item
                       </button>
+                    </div>
+
+                    {/* Description box - only visible in multi-item mode */}
+                    <div className="mb-4 bg-slate-50 p-4 rounded-lg border border-slate-200">
+                      <label className="block text-sm font-semibold text-slate-700 mb-2">
+                        Description <span className="font-normal text-slate-400 text-xs">(optional — auto-filled from items in multi-item mode)</span>
+                      </label>
+                      <input
+                        type="text"
+                        placeholder="e.g., Cotton Fabric Purchase, Monthly Services..."
+                        value={newEntry.description}
+                        onChange={(e) => setNewEntry({ ...newEntry, description: e.target.value })}
+                        className="w-full px-4 py-2.5 rounded-lg border border-slate-300 focus:border-blue-500 focus:ring-2 focus:ring-blue-100 transition-all font-medium text-slate-900 bg-white placeholder-slate-400"
+                      />
                     </div>
 
                     <div className="space-y-3 max-h-[65vh] overflow-y-auto">
@@ -1625,18 +1820,22 @@ const GeneralLedger = () => {
 
                     {/* Summary Box */}
                     <div className="bg-gradient-to-r from-blue-500 to-blue-600 rounded-lg p-4 mt-4 text-white">
-                      <div className="grid grid-cols-3 gap-4">
+                      <div className="grid grid-cols-4 gap-4">
                         <div>
                           <p className="text-xs font-semibold opacity-90">Items</p>
                           <p className="text-2xl font-bold">{lineItems.length}</p>
                         </div>
                         <div>
-                          <p className="text-xs font-semibold opacity-90">Total Qty</p>
-                          <p className="text-2xl font-bold">{lineItems.reduce((sum, item) => sum + Number(item.quantity), 0)}</p>
+                          <p className="text-xs font-semibold opacity-90">Subtotal</p>
+                          <p className="text-2xl font-bold">{formatCurrency(getLineItemsTotal())}</p>
                         </div>
                         <div>
-                          <p className="text-xs font-semibold opacity-90">Amount</p>
-                          <p className="text-2xl font-bold">{formatCurrency(getLineItemsTotal())}</p>
+                          <p className="text-xs font-semibold opacity-90">Tax</p>
+                          <p className="text-2xl font-bold">{formatCurrency(lineItems.reduce((s, item) => { const amt = item.amount || ((Number(item.quantity)||0)*(Number(item.rate)||0)); return s + amt*(Number(item.taxRate)||0)/100; }, 0))}</p>
+                        </div>
+                        <div>
+                          <p className="text-xs font-semibold opacity-90">Total (incl. Tax)</p>
+                          <p className="text-2xl font-bold">{formatCurrency(getLineItemsTotal() + lineItems.reduce((s, item) => { const amt = item.amount || ((Number(item.quantity)||0)*(Number(item.rate)||0)); return s + amt*(Number(item.taxRate)||0)/100; }, 0))}</p>
                         </div>
                       </div>
                     </div>
@@ -1664,7 +1863,10 @@ const GeneralLedger = () => {
                             type="text"
                             placeholder="INV-1001"
                             value={newEntry.billNo}
-                            onChange={(e) => setNewEntry({ ...newEntry, billNo: e.target.value })}
+                            onChange={(e) => {
+                              setNewEntry({ ...newEntry, billNo: e.target.value });
+                              lookupPendingEntry(e.target.value);
+                            }}
                             className="w-full px-3 py-2 border border-slate-300 rounded bg-white text-slate-900 text-sm font-medium focus:border-blue-500 focus:ring-2 focus:ring-blue-100 transition-all"
                           />
                         </div>
@@ -1746,6 +1948,35 @@ const GeneralLedger = () => {
                       </div>
                     </label>
                   </div>
+
+                  {/* Payment Status — only for Debit entries */}
+                  {newEntry.entryType === 'debit' && (
+                    <div className="mt-4 pt-4 border-t border-slate-200">
+                      <p className="text-xs font-bold text-slate-700 mb-3 uppercase tracking-wider">Payment Status</p>
+                      <div className="flex gap-4">
+                        <label className="flex items-center gap-2 cursor-pointer">
+                          <input
+                            type="radio"
+                            name="isPaid"
+                            checked={newEntry.isPaid !== false}
+                            onChange={() => setNewEntry({ ...newEntry, isPaid: true })}
+                            className="w-4 h-4 text-green-600"
+                          />
+                          <span className="text-sm font-semibold text-green-700">💰 Paid — creates invoice + payment</span>
+                        </label>
+                        <label className="flex items-center gap-2 cursor-pointer">
+                          <input
+                            type="radio"
+                            name="isPaid"
+                            checked={newEntry.isPaid === false}
+                            onChange={() => setNewEntry({ ...newEntry, isPaid: false })}
+                            className="w-4 h-4 text-amber-600"
+                          />
+                          <span className="text-sm font-semibold text-amber-700">📋 Pending — invoice only (unpaid)</span>
+                        </label>
+                      </div>
+                    </div>
+                  )}
                 </div>
 
                 {/* Payment Section */}
@@ -1796,11 +2027,22 @@ const GeneralLedger = () => {
               {/* Footer */}
               <div className="sticky bottom-0 bg-slate-50 border-t border-slate-200 px-8 py-4 flex justify-end gap-3">
                 <button
-                  onClick={() => setShowAddModal(false)}
+                  onClick={() => { setShowAddModal(false); setPendingMatchEntry(null); }}
                   className="px-6 py-2.5 rounded-lg bg-slate-200 hover:bg-slate-300 text-slate-900 font-semibold transition-all"
                 >
                   Cancel
                 </button>
+                {pendingMatchEntry && (
+                  <button
+                    onClick={handleMarkAsPaid}
+                    className="px-6 py-2.5 rounded-lg bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-600 hover:to-amber-700 text-white font-semibold transition-all shadow-md hover:shadow-lg flex items-center gap-2"
+                  >
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                    </svg>
+                    Mark as Paid
+                  </button>
+                )}
                 <button
                   onClick={handleAddEntry}
                   className="px-6 py-2.5 rounded-lg bg-gradient-to-r from-blue-600 to-blue-700 hover:from-blue-700 hover:to-blue-800 text-white font-semibold transition-all shadow-md hover:shadow-lg flex items-center gap-2"
