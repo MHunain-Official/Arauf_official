@@ -117,6 +117,7 @@ const GeneralLedger = () => {
     billNo: '',
     paymentMode: 'Cash',
     chequeNo: '',
+    dueDate: '',
     entryType: 'debit', // 'debit' or 'credit'
     salesTaxRate: 0,
     isPaid: true, // true = create both invoice+payment; false = invoice (pending) only
@@ -143,6 +144,7 @@ const GeneralLedger = () => {
       billNo: '',
       paymentMode: 'Cash',
       chequeNo: '',
+      dueDate: '',
       entryType: 'debit',
       salesTaxRate: 0,
       isPaid: true,
@@ -408,6 +410,7 @@ const GeneralLedger = () => {
 
     // Common fields
     const billNo = newEntry.billNo || null;
+    const entryDueDate = newEntry.dueDate || null;
     const entryDesc = newEntry.description || billNo || `Entry-${Date.now()}`;
 
     if (useLineItems) {
@@ -465,7 +468,7 @@ const GeneralLedger = () => {
         credit: 0,
         balance: 0,
         days: 0,
-        dueDate: null,
+        dueDate: entryDueDate,
         has_multiple_items: true,
         isManualEntry: true,
         _isTaxEntry: false,
@@ -517,7 +520,7 @@ const GeneralLedger = () => {
           credit: 0,
           balance: 0,
           days: 0,
-          dueDate: null,
+          dueDate: entryDueDate,
           has_multiple_items: false,
           isManualEntry: true,
           _isTaxEntry: true,
@@ -577,7 +580,7 @@ const GeneralLedger = () => {
         credit: 0,
         balance: 0,
         days: 0,
-        dueDate: null,
+        dueDate: entryDueDate,
         has_multiple_items: false,
         isManualEntry: true,
         _isTaxEntry: false,
@@ -624,7 +627,7 @@ const GeneralLedger = () => {
           credit: 0,
           balance: 0,
           days: 0,
-          dueDate: null,
+          dueDate: entryDueDate,
           has_multiple_items: false,
           isManualEntry: true,
           _isTaxEntry: true,
@@ -1112,6 +1115,7 @@ const GeneralLedger = () => {
       billNo,
       paymentMode: detailEntry.payment_mode || detailEntry.paymentMode || 'Cash',
       chequeNo: detailEntry.cheque_no || detailEntry.chequeNo || '',
+      dueDate: detailEntry.due_date || detailEntry.dueDate || '',
       entryType: debit >= credit ? 'debit' : 'credit',
       salesTaxRate: taxRate > 0 ? taxRate : (amountWithoutTax > 0 ? (((amount - amountWithoutTax) / amountWithoutTax) * 100).toFixed(2) : 0),
       isPaid: hasCreditSibling
@@ -1198,6 +1202,7 @@ const GeneralLedger = () => {
                   }))
                 : undefined,
               salesTaxRate: Number(newEntry.salesTaxRate || 0),
+              dueDate: row.due_date || row.dueDate || null,
               status: row.status || 'unpaid', // locked in edit mode
               paymentMode: row.payment_mode || row.paymentMode || 'Cash', // locked in edit mode
               chequeNo: row.cheque_no || row.chequeNo || null // locked in edit mode
@@ -1917,7 +1922,7 @@ const GeneralLedger = () => {
                 {/* Basic Info Section */}
                 <div className="bg-slate-50 rounded-lg p-6 mb-6 border border-slate-200">
                   <h3 className="text-sm font-bold text-slate-900 mb-4 uppercase tracking-wider">Transaction Details</h3>
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                     <div>
                       <label className="block text-sm font-semibold text-slate-700 mb-2">Date</label>
                       <input
@@ -1928,10 +1933,10 @@ const GeneralLedger = () => {
                       />
                     </div>
                     <div>
-                      <label className="block text-sm font-semibold text-slate-700 mb-2">Bill #</label>
+                      <label className="block text-sm font-semibold text-slate-700 mb-2">Invoice Number</label>
                       <input
                         type="text"
-                        placeholder="INV-1001"
+                        placeholder="INV-1001 / REF-01"
                         value={newEntry.billNo}
                         onChange={(e) => {
                           if (editingEntryId) return;
@@ -1943,6 +1948,20 @@ const GeneralLedger = () => {
                           editingEntryId
                             ? 'bg-slate-100 text-slate-500 cursor-not-allowed'
                             : 'focus:border-blue-500 focus:ring-2 focus:ring-blue-100 text-slate-900 bg-white placeholder-slate-400'
+                        }`}
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-semibold text-slate-700 mb-2">Payment Deadline</label>
+                      <input
+                        type="date"
+                        value={newEntry.dueDate || ''}
+                        onChange={(e) => setNewEntry({ ...newEntry, dueDate: e.target.value })}
+                        disabled={!!editingEntryId}
+                        className={`w-full px-4 py-2.5 rounded-lg border border-slate-300 transition-all font-medium ${
+                          editingEntryId
+                            ? 'bg-slate-100 text-slate-500 cursor-not-allowed'
+                            : 'focus:border-blue-500 focus:ring-2 focus:ring-blue-100 text-slate-900 bg-white'
                         }`}
                       />
                     </div>
@@ -2122,7 +2141,7 @@ const GeneralLedger = () => {
 
                       <div className="grid grid-cols-1 md:grid-cols-6 gap-4">
                         <div className="md:col-span-1">
-                          <label className="block text-xs font-semibold text-slate-700 mb-1.5 uppercase">Bill #</label>
+                          <label className="block text-xs font-semibold text-slate-700 mb-1.5 uppercase">Invoice Number</label>
                           <input
                             type="text"
                             placeholder="INV-1001"

@@ -56,6 +56,7 @@ const InvoiceForm = ({ onSubmit, onCancel, initialData = null }) => {
   }]);
 
   const [formData, setFormData] = useState({
+    invoiceNumber: "",
     customerName: "",
     customerEmail: "",
     phone: "",
@@ -75,6 +76,9 @@ const InvoiceForm = ({ onSubmit, onCancel, initialData = null }) => {
   });
 
   const [customers, setCustomers] = useState([]);
+  const [knownInvoiceNumbers, setKnownInvoiceNumbers] = useState([]);
+  const [invoiceSuggestion, setInvoiceSuggestion] = useState("");
+  const [invoiceNumberValidation, setInvoiceNumberValidation] = useState({ type: "idle", message: "" });
   const [searchTerm, setSearchTerm] = useState('');
   const [showDropdown, setShowDropdown] = useState(false);
   const [filteredCustomers, setFilteredCustomers] = useState([]);
@@ -89,6 +93,37 @@ const InvoiceForm = ({ onSubmit, onCancel, initialData = null }) => {
     stn: "",
     ntn: ""
   });
+  const invoiceValidationTimerRef = useRef(null);
+
+  const normalizeInvoiceNumber = (value = "") => value.toString().trim();
+  const isInvoiceFormatValid = (value) => /^INV\d{2}-\d{1,2}-\d{3,}(?:-\d+)?$/.test(value);
+
+  const isInvoiceNumberDuplicate = useCallback((invoiceNumber, allInvoiceNumbers = knownInvoiceNumbers) => {
+    const candidate = normalizeInvoiceNumber(invoiceNumber).toLowerCase();
+    if (!candidate) return false;
+
+    const editingNumber = normalizeInvoiceNumber(initialData?.invoice_number || "").toLowerCase();
+    return (allInvoiceNumbers || []).some((row) => {
+      const existing = normalizeInvoiceNumber(row?.invoice_number || "").toLowerCase();
+      if (!existing) return false;
+      if (editingNumber && existing === editingNumber) return false;
+      return existing === candidate;
+    });
+  }, [knownInvoiceNumbers, initialData]);
+
+  const fetchInvoiceNumbers = useCallback(async () => {
+    const baseUrl = process.env.REACT_APP_API_BASE_URL || 'http://localhost:5000/api';
+    const response = await fetch(`${baseUrl}/invoice-numbers`);
+    if (!response.ok) {
+      throw new Error("Failed to fetch invoice numbers");
+    }
+    const numbers = await response.json();
+    const sanitized = Array.isArray(numbers) ? numbers : [];
+    setKnownInvoiceNumbers(sanitized);
+    const suggestion = generateInvoiceId(sanitized);
+    setInvoiceSuggestion(suggestion);
+    return sanitized;
+  }, []);
 
   // Handle customer selection from autocomplete
   const handleCustomerSelect = (customer) => {
@@ -182,6 +217,7 @@ const InvoiceForm = ({ onSubmit, onCancel, initialData = null }) => {
       
       // Set form data
       setFormData({
+        invoiceNumber: initialData.invoice_number || "",
         customerName: initialData.customer_name || "",
         customerEmail: initialData.customer_email || "",
         phone: initialData.p_number || "",
@@ -256,12 +292,83 @@ const InvoiceForm = ({ onSubmit, onCancel, initialData = null }) => {
     }
   }, [initialData]);
 
+  useEffect(() => {
+    const loadInvoiceNumbers = async () => {
+      try {
+        const existingNumbers = await fetchInvoiceNumbers();
+        if (!initialData) {
+          const nextInvoiceNumber = generateInvoiceId(existingNumbers || []);
+          setFormData((prev) => ({
+            ...prev,
+            invoiceNumber: prev.invoiceNumber || nextInvoiceNumber
+          }));
+        }
+      } catch (error) {
+        console.error('Error generating next invoice number:', error);
+      }
+    };
+
+    loadInvoiceNumbers();
+  }, [initialData, fetchInvoiceNumbers]);
+
+  useEffect(() => {
+    const invoiceNumber = normalizeInvoiceNumber(formData.invoiceNumber);
+
+    if (invoiceValidationTimerRef.current) {
+      clearTimeout(invoiceValidationTimerRef.current);
+    }
+
+    if (!invoiceNumber) {
+      setInvoiceNumberValidation({
+        type: "warning",
+        message: invoiceSuggestion
+          ? `No number entered. Suggested: ${invoiceSuggestion}`
+          : "Invoice number will be generated automatically."
+      });
+      return;
+    }
+
+    setInvoiceNumberValidation({ type: "checking", message: "Checking invoice number..." });
+
+    invoiceValidationTimerRef.current = setTimeout(() => {
+      if (!isInvoiceFormatValid(invoiceNumber)) {
+        setInvoiceNumberValidation({
+          type: "error",
+          message: "Use format INVyy-m-### (minimum 3 digits, e.g., INV26-5-001 or INV26-5-1234)."
+        });
+        return;
+      }
+
+      if (isInvoiceNumberDuplicate(invoiceNumber)) {
+        setInvoiceNumberValidation({
+          type: "error",
+          message: invoiceSuggestion
+            ? `This number already exists. Try: ${invoiceSuggestion}`
+            : "This number already exists."
+        });
+        return;
+      }
+
+      setInvoiceNumberValidation({
+        type: "success",
+        message: "Invoice number is available."
+      });
+    }, 250);
+
+    return () => {
+      if (invoiceValidationTimerRef.current) {
+        clearTimeout(invoiceValidationTimerRef.current);
+      }
+    };
+  }, [formData.invoiceNumber, invoiceSuggestion, isInvoiceNumberDuplicate]);
+
   const handleChange = (e) => {
     const { name, value } = e.target;
+    const nextValue = name === "invoiceNumber" ? value.replace(/\s/g, "") : value;
   // form change
     setFormData((prev) => ({
       ...prev,
-      [name]: value,
+      [name]: nextValue,
     }));
   };
 
@@ -277,17 +384,20 @@ const InvoiceForm = ({ onSubmit, onCancel, initialData = null }) => {
   // Handle invoice item changes
   const handleItemChange = (index, field, value) => {
     const updatedItems = [...invoiceItems];
+    const numericFields = ['quantity', 'rate', 'net_weight'];
+    const sanitizedValue = numericFields.includes(field)
+      ? String(value ?? '').replace(/[^0-9.]/g, '')
+      : value;
+
     updatedItems[index] = {
       ...updatedItems[index],
-      [field]: value
+      [field]: sanitizedValue
     };
 
-    // Calculate amount for this item
-    if (field === 'quantity' || field === 'rate') {
-      const quantity = parseFloat(updatedItems[index].quantity) || 0;
-      const rate = parseFloat(updatedItems[index].rate) || 0;
-      updatedItems[index].amount = quantity * rate;
-    }
+    // Always derive amount from quantity * rate so totals never go stale.
+    const quantity = parseFloat(updatedItems[index].quantity) || 0;
+    const rate = parseFloat(updatedItems[index].rate) || 0;
+    updatedItems[index].amount = quantity * rate;
 
     setInvoiceItems(updatedItems);
   };
@@ -434,7 +544,7 @@ const InvoiceForm = ({ onSubmit, onCancel, initialData = null }) => {
     }
   };
 
-  const handleSubmit = (e) => {
+  const handleSubmit = async (e) => {
     e.preventDefault();
     
     // If user typed a name but didn't select from dropdown, try to match it against loaded customers
@@ -466,8 +576,36 @@ const InvoiceForm = ({ onSubmit, onCancel, initialData = null }) => {
       return;
     }
 
+    let latestNumbers = knownInvoiceNumbers;
+    try {
+      latestNumbers = await fetchInvoiceNumbers();
+    } catch (error) {
+      console.error('Error refreshing invoice numbers for validation:', error);
+    }
+
+    let normalizedInvoiceNumber = normalizeInvoiceNumber(formData.invoiceNumber);
+    if (!normalizedInvoiceNumber) {
+      normalizedInvoiceNumber = invoiceSuggestion || generateInvoiceId(latestNumbers || []);
+      setFormData((prev) => ({ ...prev, invoiceNumber: normalizedInvoiceNumber }));
+    }
+
+    if (normalizedInvoiceNumber) {
+      if (!isInvoiceFormatValid(normalizedInvoiceNumber)) {
+        alert('Invalid invoice number format. Use INVyy-m-### with minimum 3 digits (e.g., INV26-5-001 or INV26-5-1234).');
+        return;
+      }
+
+      if (isInvoiceNumberDuplicate(normalizedInvoiceNumber, latestNumbers)) {
+        const suggestion = generateInvoiceId(latestNumbers || []);
+        setInvoiceSuggestion(suggestion);
+        alert(`Invoice number already exists. Try this: ${suggestion}`);
+        return;
+      }
+    }
+
     // Prepare invoice data with multiple items
     const invoiceData = {
+      invoice_number: normalizedInvoiceNumber || undefined,
       customer_name: formData.customerName,
       customer_email: formData.customerEmail,
       p_number: formData.phone,
@@ -492,7 +630,7 @@ const InvoiceForm = ({ onSubmit, onCancel, initialData = null }) => {
         unit: item.unit || '',
         rate: parseFloat(item.rate) || 0,
         net_weight: item.net_weight !== undefined && item.net_weight !== '' ? parseFloat(item.net_weight) : 0,
-        amount: parseFloat(item.amount) || 0
+        amount: (parseFloat(item.quantity) || 0) * (parseFloat(item.rate) || 0)
       }))
     };
 
@@ -502,7 +640,9 @@ const InvoiceForm = ({ onSubmit, onCancel, initialData = null }) => {
   // Calculate subtotal, tax, and total amounts based on all items
   useEffect(() => {
     const subtotal = invoiceItems.reduce((sum, item) => {
-      return sum + (parseFloat(item.amount) || 0);
+      const quantity = parseFloat(item.quantity) || 0;
+      const rate = parseFloat(item.rate) || 0;
+      return sum + (quantity * rate);
     }, 0);
 
     const taxRate = parseFloat(formData.salesTax) || 0;
@@ -520,6 +660,47 @@ const InvoiceForm = ({ onSubmit, onCancel, initialData = null }) => {
   return (
     <div className="max-w-5xl mx-auto bg-white">
       <form onSubmit={handleSubmit} className="space-y-8">
+        <section className="rounded-xl border border-blue-200 bg-blue-50 p-4">
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
+            <div className="w-full sm:max-w-md">
+              <Input
+                label="Invoice Number"
+                type="text"
+                name="invoiceNumber"
+                value={formData.invoiceNumber}
+                onChange={handleChange}
+                placeholder="e.g., INV26-5-001"
+                readOnly={Boolean(initialData)}
+              />
+            </div>
+            <button
+              type="button"
+              className="rounded-lg border border-blue-300 bg-white px-3 py-2 text-sm font-medium text-blue-700 hover:bg-blue-100"
+              onClick={() => {
+                if (!invoiceSuggestion) return;
+                setFormData((prev) => ({ ...prev, invoiceNumber: invoiceSuggestion }));
+              }}
+            >
+              Use Suggested: {invoiceSuggestion || "N/A"}
+            </button>
+          </div>
+          <p
+            className={`mt-2 text-sm ${
+              invoiceNumberValidation.type === "error"
+                ? "text-red-600"
+                : invoiceNumberValidation.type === "success"
+                ? "text-green-600"
+                : invoiceNumberValidation.type === "checking"
+                ? "text-blue-600"
+                : "text-gray-600"
+            }`}
+          >
+            {initialData
+              ? "Invoice number is locked for edits. You can update all other fields."
+              : (invoiceNumberValidation.message || "Invoice number can be edited manually.")}
+          </p>
+        </section>
+
         {/* Customer Information */}
         <section>
           <h2 className="text-xl font-semibold text-gray-800 mb-4 border-b pb-2">
@@ -781,7 +962,7 @@ const InvoiceForm = ({ onSubmit, onCancel, initialData = null }) => {
                     <td className="px-4 py-3">
                       <input
                         type="text"
-                        value={item.amount ? item.amount.toFixed(2) : '0.00'}
+                        value={(((parseFloat(item.quantity) || 0) * (parseFloat(item.rate) || 0)).toFixed(2))}
                         readOnly
                         className="w-full bg-gray-50 border border-gray-300 rounded px-3 py-2 text-sm"
                       />
@@ -2205,7 +2386,7 @@ const InvoiceManagement = () => {
                     <td className="px-4 py-4 text-sm font-medium text-gray-900 whitespace-nowrap">
                       <div className="flex flex-col">
                         <div className="flex items-center space-x-2">
-                          <span>{invoice.invoice_type === 'po_invoice' ? invoice.invoice_number : `INV-${invoice.id}`}</span>
+                          <span>{invoice.invoice_number || `INV-${invoice.id}`}</span>
                           {invoice.invoice_type === 'po_invoice' && (
                             <span className="px-2 py-1 text-xs font-medium bg-blue-100 text-blue-800 rounded-full">
                               PO

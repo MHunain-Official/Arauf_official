@@ -106,6 +106,11 @@ const InvoiceDetailsLayoutImproved = () => {
   const [showPaymentHistory, setShowPaymentHistory] = useState(false);
   const invoiceRef = useRef();
   const isPOInvoice = type === "po";
+  const displayInvoiceNumber = invoice?.invoice_number
+    ? String(invoice.invoice_number).trim()
+    : isPOInvoice
+      ? `PO-${id}`
+      : `INV-${id}`;
 
   // PDF Generation Function - FIXED VERSION
   const generatePDF = () => {
@@ -124,7 +129,7 @@ const InvoiceDetailsLayoutImproved = () => {
         <html>
         <head>
           <meta charset="utf-8">
-          <title>Invoice ${invoice.invoice_number}</title>
+          <title>Invoice ${displayInvoiceNumber}</title>
           <style>
             * {
               margin: 0;
@@ -335,7 +340,7 @@ const InvoiceDetailsLayoutImproved = () => {
             
               <div class="invoice-info">
                 <div class="invoice-info-left">
-                  <div><span class="label">Invoice No :</span> ${invoice.invoice_number}</div>
+                  <div><span class="label">Invoice No :</span> ${displayInvoiceNumber}</div>
                 </div>
                 <div class="invoice-info-right">
                   <div><span class="label">Invoice Date:</span> ${invoice.bill_date ? new Date(invoice.bill_date).toLocaleDateString("en-GB", { day: "2-digit", month: "2-digit", year: "numeric" }) : "N/A"}</div>
@@ -355,7 +360,7 @@ const InvoiceDetailsLayoutImproved = () => {
                   <div><span class="label">Sales Tax Reg No :</span> ${invoice.st_reg_no || '32-77-8761-411-88'}</div>
                   <div><span class="label">Phone Number :</span> ${invoice.p_number || '0333-1234567'}</div>
                   <div><span class="label">National Tax No :</span> ${invoice.ntn_number || '7555850-8'}</div>
-                  <div><span class="label">Terms of Sale:</span> ${invoice.terms_of_payment || (invoice.payment_days != null ? 'Payment due within ' + invoice.payment_days + ' days' : 'Within 15 days')}</div>
+                  <div><span class="label">Terms of Sale:</span> ${invoice.payment_days != null ? ('Payment due within ' + invoice.payment_days + ' days') : (invoice.terms_of_payment || 'Within 15 days')}</div>
                 </div>
               </div>
       
@@ -541,7 +546,7 @@ const InvoiceDetailsLayoutImproved = () => {
 
   // Handle PO invoice deletion
   const handleDeletePOInvoice = async () => {
-    const confirmMessage = `Are you sure you want to delete PO invoice ${invoice.invoice_number}?
+    const confirmMessage = `Are you sure you want to delete PO invoice ${displayInvoiceNumber}?
 
 This will:
 - Remove the invoice from the system permanently
@@ -629,7 +634,7 @@ This action cannot be undone.`;
             subtotal: data.subtotal,
             tax_rate: data.tax_rate,
             salesTax: data.tax_amount,
-            terms_of_payment: "As per agreement",
+            terms_of_payment: data.terms_of_payment || null,
             delivery_date: null,
             is_sent: data.status !== "Draft",
           };
@@ -725,8 +730,8 @@ This action cannot be undone.`;
               <div className="border-l border-gray-300 pl-4">
                 <h1 className="text-[24px] font-bold text-[#333843]">
                   {isPOInvoice
-                    ? `PO Invoice #${invoice.invoice_number}`
-                    : `Invoice #${invoice.invoice_number}`}
+                    ? `PO Invoice #${displayInvoiceNumber}`
+                    : `Invoice #${displayInvoiceNumber}`}
                 </h1>
                 <p className="text-[16px] text-[#667085]">
                   Invoice Date :{" "}
@@ -818,7 +823,7 @@ This action cannot be undone.`;
                             Invoice No :
                           </span>
                           <span className="text-gray-800">
-                            {invoice.invoice_number}
+                            {displayInvoiceNumber}
                           </span>
                         </div>
                       </div>
@@ -901,12 +906,11 @@ This action cannot be undone.`;
                             Terms of Sale :
                           </span>
                           <span className="text-gray-800">
-                            {invoice.terms_of_payment ||
-                              (invoice.payment_days != null
-                                ? "Payment due within " +
-                                  invoice.payment_days +
-                                  " days"
-                                : "Within 15 days")}
+                            {invoice.payment_days != null
+                              ? "Payment due within " +
+                                invoice.payment_days +
+                                " days"
+                              : invoice.terms_of_payment || "Within 15 days"}
                           </span>
                         </div>
                       </div>

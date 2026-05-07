@@ -22,6 +22,7 @@ const InvoiceForm = ({ initialData, onSubmit, onCancel }) => {
   }]);
 
   const [formData, setFormData] = useState({
+    invoiceNumber: "",
     customerName: "",
     customerEmail: "",
     phone: "",
@@ -35,6 +36,7 @@ const InvoiceForm = ({ initialData, onSubmit, onCancel }) => {
     taxAmount: 0,
     totalAmount: 0,
     billDate: new Date().toISOString().split('T')[0], // Default to today
+    paymentDeadline: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
     paymentDays: 30, // Default to 30 days (user-editable)
     note: "",
   });
@@ -93,6 +95,7 @@ const InvoiceForm = ({ initialData, onSubmit, onCancel }) => {
     if (initialData) {
       // Populate form with existing invoice data
       setFormData({
+        invoiceNumber: initialData.invoice_number || initialData.invoiceNumber || '',
         customerName: initialData.customer_name || initialData.customerName || '',
         customerEmail: initialData.customer_email || initialData.customerEmail || '',
         phone: initialData.customer_phone || initialData.phone || '',
@@ -106,6 +109,7 @@ const InvoiceForm = ({ initialData, onSubmit, onCancel }) => {
         taxAmount: initialData.tax_amount || initialData.taxAmount || 0,
         totalAmount: initialData.total_amount || initialData.totalAmount || 0,
         billDate: initialData.bill_date || initialData.billDate || new Date().toISOString().split('T')[0],
+        paymentDeadline: initialData.payment_deadline || initialData.paymentDeadline || '',
         paymentDays: initialData.payment_days || initialData.paymentDays || 30,
         note: initialData.note || initialData.notes || '',
       });
@@ -303,6 +307,11 @@ const InvoiceForm = ({ initialData, onSubmit, onCancel }) => {
       alert("Payment Days is required");
       return;
     }
+    if (!formData.paymentDeadline) {
+      alert("Payment Deadline is required.");
+      return;
+    }
+
 
     const parsedPaymentDays = Number(formData.paymentDays);
     if (isNaN(parsedPaymentDays) || parsedPaymentDays < 0 || parsedPaymentDays > 365) {
@@ -315,6 +324,7 @@ const InvoiceForm = ({ initialData, onSubmit, onCancel }) => {
       
       // Prepare invoice data
       const invoiceData = {
+        invoice_number: formData.invoiceNumber || undefined,
         customer_name: formData.customerName,
         customer_email: formData.customerEmail,
         p_number: formData.phone,
@@ -329,6 +339,7 @@ const InvoiceForm = ({ initialData, onSubmit, onCancel }) => {
         tax_amount: parseFloat(formData.taxAmount) || 0,
         total_amount: parseFloat(formData.totalAmount) || 0,
   bill_date: formData.billDate,
+  payment_deadline: formData.paymentDeadline,
   payment_days: Number(formData.paymentDays),
         note: formData.note,
         status: "Pending",
@@ -369,6 +380,7 @@ const InvoiceForm = ({ initialData, onSubmit, onCancel }) => {
         
         // Reset form after successful submission
         setFormData({
+          invoiceNumber: "",
           customerName: "",
           customerEmail: "",
           phone: "",
@@ -382,6 +394,7 @@ const InvoiceForm = ({ initialData, onSubmit, onCancel }) => {
           taxAmount: 0,
           totalAmount: 0,
           billDate: new Date().toISOString().split('T')[0],
+          paymentDeadline: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
           paymentDays: 30,
           note: "",
         });
@@ -428,6 +441,21 @@ const InvoiceForm = ({ initialData, onSubmit, onCancel }) => {
       totalAmount: totalAmount
     }));
   }, [invoiceItems, formData.salesTax]);
+
+  // Keep payment deadline aligned with bill date + payment days.
+  useEffect(() => {
+    if (!formData.billDate) return;
+    const days = Number(formData.paymentDays);
+    if (Number.isNaN(days) || days < 0) return;
+    const baseDate = new Date(formData.billDate);
+    if (Number.isNaN(baseDate.getTime())) return;
+    const due = new Date(baseDate);
+    due.setDate(due.getDate() + days);
+    const computed = due.toISOString().split('T')[0];
+    if (formData.paymentDeadline !== computed) {
+      setFormData(prev => ({ ...prev, paymentDeadline: computed }));
+    }
+  }, [formData.billDate, formData.paymentDays]);
 
   return (
     <div className="max-w-5xl mx-auto bg-white p-8 sm:p-12 transition-all duration-300">
@@ -723,6 +751,14 @@ const InvoiceForm = ({ initialData, onSubmit, onCancel }) => {
           </h2>
           <div className="grid sm:grid-cols-2 gap-6">
             <Input
+              label="Invoice Number (Optional)"
+              type="text"
+              name="invoiceNumber"
+              value={formData.invoiceNumber}
+              onChange={handleChange}
+              placeholder="e.g., INV-1001"
+            />
+            <Input
               label="Bill Date"
               type="date"
               name="billDate"
@@ -739,6 +775,14 @@ const InvoiceForm = ({ initialData, onSubmit, onCancel }) => {
               required
               min="0"
               max="365"
+            />
+            <Input
+              label="Payment Deadline"
+              type="date"
+              name="paymentDeadline"
+              value={formData.paymentDeadline}
+              onChange={handleChange}
+              required
             />
           </div>
           <div className="mt-6">

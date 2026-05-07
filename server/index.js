@@ -2785,6 +2785,7 @@ app.post("/api/invoices", (req, res) => {
   logger.debug("Received invoice creation request:", req.body); // Debug log
 
   const {
+    invoice_number: requested_invoice_number,
     customer_name,
     customer_email,
     p_number,
@@ -2869,20 +2870,61 @@ app.post("/api/invoices", (req, res) => {
       });
     }
 
-    // Get the next invoice ID for sequential numbering
-    const getMaxInvoiceIdQuery = "SELECT MAX(id) as max_id FROM invoice";
-
-    db.query(getMaxInvoiceIdQuery, (err, results) => {
-      if (err) {
-        logger.error("Error getting max invoice ID:", err);
-        // Fallback to timestamp if query fails
-        const invoice_number = `INV-${new Date().getFullYear()}-${Date.now()}`;
-        proceedWithInvoiceCreation(invoice_number);
-      } else {
-        const nextId = (results[0]?.max_id || 0) + 1;
-        const invoice_number = `INV-${nextId}`;
-        proceedWithInvoiceCreation(invoice_number);
+    const manualInvoiceNumber = String(requested_invoice_number || "").trim();
+    if (manualInvoiceNumber) {
+      const invoiceFormatRegex = /^INV\d{2}-\d{1,2}-\d{3,}(?:-\d+)?$/;
+      if (!invoiceFormatRegex.test(manualInvoiceNumber)) {
+        return res.status(400).json({
+          error:
+            "Invalid invoice number format. Use INVyy-m-### with minimum 3 digits (e.g., INV26-5-001).",
+        });
       }
+
+      const duplicateCheckQuery = "SELECT id FROM invoice WHERE invoice_number = ? LIMIT 1";
+      db.query(duplicateCheckQuery, [manualInvoiceNumber], (dupErr, dupRows) => {
+        if (dupErr) {
+          logger.error("Error checking duplicate invoice number:", dupErr);
+          return res.status(500).json({ error: "Failed to validate invoice number" });
+        }
+        if (dupRows && dupRows.length > 0) {
+          return res.status(400).json({ error: "Invoice number already exists" });
+        }
+        proceedWithInvoiceCreation(manualInvoiceNumber);
+      });
+      return;
+    }
+
+    // Generate invoice number in INVyy-m-### format for consistency with frontend utility.
+    const now = new Date();
+    const year = now.getFullYear().toString().slice(-2);
+    const month = now.getMonth() + 1;
+    const prefix = `INV${year}-${month}-`;
+    const likePattern = `${prefix}%`;
+
+    const getCurrentPeriodInvoiceNumbersQuery =
+      "SELECT invoice_number FROM invoice WHERE invoice_number LIKE ?";
+    db.query(getCurrentPeriodInvoiceNumbersQuery, [likePattern], (err, rows) => {
+      if (err) {
+        logger.error("Error getting current period invoice numbers:", err);
+        const fallbackInvoiceNumber = `${prefix}${Date.now().toString().slice(-3)}`;
+        proceedWithInvoiceCreation(fallbackInvoiceNumber);
+        return;
+      }
+
+      let maxSequential = 0;
+      for (const row of rows || []) {
+        const existingNumber = row?.invoice_number;
+        if (!existingNumber || !existingNumber.startsWith(prefix)) continue;
+        const sequentialPart = existingNumber.substring(prefix.length);
+        const sequential = parseInt(sequentialPart, 10);
+        if (!Number.isNaN(sequential) && sequential > maxSequential) {
+          maxSequential = sequential;
+        }
+      }
+
+      const nextSequential = String(maxSequential + 1).padStart(3, "0");
+      const invoice_number = `${prefix}${nextSequential}`;
+      proceedWithInvoiceCreation(invoice_number);
     });
 
     function proceedWithInvoiceCreation(invoice_number) {
@@ -3044,6 +3086,7 @@ app.post("/api/invoices", (req, res) => {
 app.put("/api/invoices/:id", (req, res) => {
   const { id } = req.params;
   const {
+    invoice_number: requested_invoice_number,
     customer_name,
     customer_email,
     p_number,
@@ -3066,25 +3109,56 @@ app.put("/api/invoices/:id", (req, res) => {
 
   logger.debug("Updating invoice with data:", req.body);
 
-  // Calculate payment_deadline if not provided
-  let computed_payment_deadline = payment_deadline;
-
-  if (!computed_payment_deadline && bill_date) {
-    // Calculate from bill_date and payment_days (default 30 days)
-    const billDate = new Date(bill_date);
-    const days = payment_days || 30;
-    billDate.setDate(billDate.getDate() + days);
-    computed_payment_deadline = billDate.toISOString().split("T")[0];
-  }
-
-  if (!computed_payment_deadline) {
+  const requestedInvoiceNumber = String(requested_invoice_number || "").trim();
+  const invoiceFormatRegex = /^INV\d{2}-\d{1,2}-\d{3,}(?:-\d+)?$/;
+  if (requestedInvoiceNumber && !invoiceFormatRegex.test(requestedInvoiceNumber)) {
     return res.status(400).json({
-      error: "payment_deadline or bill_date with payment_days is required",
+      error:
+        "Invalid invoice number format. Use INVyy-m-### with minimum 3 digits (e.g., INV26-5-001).",
     });
   }
 
-  // Update invoice directly (transactions not supported with mysql2 pool)
-  const updateInvoiceQuery = `
+  // Invoice number is immutable after creation. Allow edits for all other fields.
+  const getCurrentInvoiceQuery =
+    "SELECT id, invoice_number FROM invoice WHERE id = ? LIMIT 1";
+  db.query(getCurrentInvoiceQuery, [id], (checkErr, checkRows) => {
+    if (checkErr) {
+      console.error("Error validating existing invoice:", checkErr);
+      return res.status(500).json({ error: "Failed to validate invoice before update" });
+    }
+
+    if (!checkRows || checkRows.length === 0) {
+      return res.status(404).json({ error: "Invoice not found" });
+    }
+
+    const currentInvoiceNumber = String(checkRows[0].invoice_number || "").trim();
+    if (requestedInvoiceNumber && requestedInvoiceNumber !== currentInvoiceNumber) {
+      return res.status(400).json({
+        error:
+          "Invoice number cannot be changed after creation. Please keep the original invoice number.",
+        invoice_number: currentInvoiceNumber,
+      });
+    }
+
+    // Calculate payment_deadline if not provided
+    let computed_payment_deadline = payment_deadline;
+
+    if (!computed_payment_deadline && bill_date) {
+      // Calculate from bill_date and payment_days (default 30 days)
+      const billDate = new Date(bill_date);
+      const days = payment_days || 30;
+      billDate.setDate(billDate.getDate() + days);
+      computed_payment_deadline = billDate.toISOString().split("T")[0];
+    }
+
+    if (!computed_payment_deadline) {
+      return res.status(400).json({
+        error: "payment_deadline or bill_date with payment_days is required",
+      });
+    }
+
+    // Update invoice directly (transactions not supported with mysql2 pool)
+    const updateInvoiceQuery = `
     UPDATE invoice SET
       customer_name = ?, customer_email = ?, p_number = ?, a_p_number = ?, address = ?,
       st_reg_no = ?, ntn_number = ?, currency = ?, subtotal = ?, tax_rate = ?, 
@@ -3093,7 +3167,7 @@ app.put("/api/invoices/:id", (req, res) => {
     WHERE id = ?
   `;
 
-  const invoiceValues = [
+    const invoiceValues = [
     customer_name,
     customer_email,
     p_number,
@@ -3111,41 +3185,41 @@ app.put("/api/invoices/:id", (req, res) => {
     note,
     status,
     id,
-  ];
+    ];
 
-  db.query(updateInvoiceQuery, invoiceValues, (err, results) => {
-    if (err) {
-      console.error("Error updating invoice:", err);
-      return res.status(500).json({ error: "Failed to update invoice" });
-    }
-
-    if (results.affectedRows === 0) {
-      return res.status(404).json({ error: "Invoice not found" });
-    }
-
-    // Delete existing items
-    const deleteItemsQuery = "DELETE FROM invoice_items WHERE invoice_id = ?";
-
-    db.query(deleteItemsQuery, [id], (err) => {
+    db.query(updateInvoiceQuery, invoiceValues, (err, results) => {
       if (err) {
-        console.error("Error deleting existing items:", err);
-        return res
-          .status(500)
-          .json({ error: "Failed to delete existing items" });
+        console.error("Error updating invoice:", err);
+        return res.status(500).json({ error: "Failed to update invoice" });
       }
 
-      // Insert new items if provided
-      if (items && Array.isArray(items) && items.length > 0) {
-        const insertItemQuery = `
+      if (results.affectedRows === 0) {
+        return res.status(404).json({ error: "Invoice not found" });
+      }
+
+      // Delete existing items
+      const deleteItemsQuery = "DELETE FROM invoice_items WHERE invoice_id = ?";
+
+      db.query(deleteItemsQuery, [id], (err) => {
+        if (err) {
+          console.error("Error deleting existing items:", err);
+          return res
+            .status(500)
+            .json({ error: "Failed to delete existing items" });
+        }
+
+        // Insert new items if provided
+        if (items && Array.isArray(items) && items.length > 0) {
+          const insertItemQuery = `
           INSERT INTO invoice_items (invoice_id, item_no, description, quantity, unit, rate, net_weight, amount, created_at)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())
         `;
 
-        let completedInserts = 0;
-        let insertError = false;
+          let completedInserts = 0;
+          let insertError = false;
 
-        items.forEach((item, index) => {
-          const itemValues = [
+          items.forEach((item, index) => {
+            const itemValues = [
             id,
             item.item_no || index + 1,
             item.description || "",
@@ -3156,47 +3230,46 @@ app.put("/api/invoices/:id", (req, res) => {
               ? parseFloat(item.net_weight)
               : 0,
             parseFloat(item.amount) || 0,
-          ];
+            ];
 
-          db.query(insertItemQuery, itemValues, (err) => {
-            if (err && !insertError) {
-              console.error("Error inserting item:", err);
-              insertError = true;
-              return res
-                .status(500)
-                .json({ error: "Failed to insert invoice items" });
-            }
+            db.query(insertItemQuery, itemValues, (err) => {
+              if (err && !insertError) {
+                console.error("Error inserting item:", err);
+                insertError = true;
+                return res
+                  .status(500)
+                  .json({ error: "Failed to insert invoice items" });
+              }
 
-            completedInserts++;
+              completedInserts++;
 
-            if (completedInserts === items.length && !insertError) {
-              // All items inserted successfully
-              logger.info("Invoice updated successfully with items");
-              handleInvoicePaymentIfNeeded(id, status);
+              if (completedInserts === items.length && !insertError) {
+                // All items inserted successfully
+                logger.info("Invoice updated successfully with items");
+                handleInvoicePaymentIfNeeded(id, status);
 
-              res.json({
-                message: "Invoice updated successfully",
-                id: id,
-                itemsUpdated: items.length,
-              });
-            }
+                res.json({
+                  message: "Invoice updated successfully",
+                  id: id,
+                  itemsUpdated: items.length,
+                });
+              }
+            });
           });
-        });
-      } else {
-        // No items to insert
-        logger.info("Invoice updated successfully");
-        handleInvoicePaymentIfNeeded(id, status);
+        } else {
+          // No items to insert
+          logger.info("Invoice updated successfully");
+          handleInvoicePaymentIfNeeded(id, status);
 
-        res.json({
-          message: "Invoice updated successfully",
-          id: id,
-          itemsUpdated: 0,
-        });
-      }
+          res.json({
+            message: "Invoice updated successfully",
+            id: id,
+            itemsUpdated: 0,
+          });
+        }
+      });
     });
   });
-
-  logger.info("Invoice updated successfully without items");
 });
 
 // Delete invoice

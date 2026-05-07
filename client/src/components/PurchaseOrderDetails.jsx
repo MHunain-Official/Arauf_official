@@ -1088,10 +1088,31 @@ const PurchaseOrderDetails = ({ poId, onBack }) => {
 
     const handleInputChange = (e) => {
       const { name, value } = e.target;
-      setInvoiceData(prev => ({
-        ...prev,
-        [name]: value
-      }));
+      setInvoiceData(prev => {
+        const next = { ...prev, [name]: value };
+
+        if (name === 'invoiceDate' || name === 'paymentDays') {
+          const base = new Date(name === 'invoiceDate' ? value : next.invoiceDate);
+          const days = Number(name === 'paymentDays' ? value : next.paymentDays);
+          if (!Number.isNaN(base.getTime()) && !Number.isNaN(days) && days >= 0) {
+            const due = new Date(base);
+            due.setDate(due.getDate() + days);
+            next.dueDate = due.toISOString().split('T')[0];
+          }
+        }
+
+        if (name === 'dueDate') {
+          const base = new Date(next.invoiceDate);
+          const due = new Date(value);
+          if (!Number.isNaN(base.getTime()) && !Number.isNaN(due.getTime())) {
+            const diffMs = due.getTime() - base.getTime();
+            const dayDiff = Math.max(0, Math.round(diffMs / (1000 * 60 * 60 * 24)));
+            next.paymentDays = dayDiff;
+          }
+        }
+
+        return next;
+      });
     };
 
     const handleSupplierChange = (e) => {
@@ -1369,7 +1390,7 @@ const PurchaseOrderDetails = ({ poId, onBack }) => {
             </div>
 
             {/* Invoice Basic Info */}
-            <div className="grid md:grid-cols-3 gap-4">
+            <div className="grid md:grid-cols-4 gap-4">
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-2">Invoice Number</label>
                 <input
@@ -1404,6 +1425,16 @@ const PurchaseOrderDetails = ({ poId, onBack }) => {
                   placeholder="e.g., 30"
                 />
                 <p className="text-xs text-gray-500 mt-1">Days for payment (default from PO: {purchaseOrder?.paymentDays || 30})</p>
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">Payment Deadline</label>
+                <input
+                  type="date"
+                  name="dueDate"
+                  value={invoiceData.dueDate}
+                  onChange={handleInputChange}
+                  className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500"
+                />
               </div>
             </div>
 
