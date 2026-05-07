@@ -15,6 +15,75 @@ async function hasEntryTypeColumn() {
   return _hasEntryTypeCache;
 }
 
+const NON_EDITABLE_ENTRY_TYPES = new Set([
+  'invoice',
+  'invoice_tax',
+  'po_invoice',
+  'po_invoice_tax',
+  'payment_tax',
+  'manual_tax'
+]);
+
+const normalizeBillNoForLookup = (billNo) => {
+  const normalized = String(billNo || '').trim();
+  if (!normalized) return '';
+  return normalized.startsWith('TAX-') ? normalized.slice(4) : normalized;
+};
+
+const isStandaloneManualEntry = async (connection, entry) => {
+  const normalizedType = String(entry.entry_type || '').toLowerCase().trim();
+  const billNo = String(entry.bill_no || '').trim();
+  const desc = String(entry.description || '').toLowerCase();
+  const ref = normalizeBillNoForLookup(entry.bill_no);
+  if (!ref) return true;
+
+  const [invoiceRows] = await connection.query(
+    `SELECT id FROM invoice WHERE LOWER(invoice_number) = LOWER(?) LIMIT 1`,
+    [ref]
+  );
+  if (invoiceRows.length > 0) return false;
+
+  const [poRows] = await connection.query(
+    `SELECT id FROM po_invoices WHERE LOWER(invoice_number) = LOWER(?) LIMIT 1`,
+    [ref]
+  );
+  const linkedToInvoiceOrPO = invoiceRows.length > 0 || poRows.length > 0;
+  if (linkedToInvoiceOrPO) return false;
+
+  const isTaxLike = billNo.startsWith('TAX-') || desc.includes('sales tax') || desc.includes('tax payment');
+  if (isTaxLike) {
+    // Allow tax rows only when they belong to standalone manual bill groups.
+    return true;
+  }
+
+  if (normalizedType && NON_EDITABLE_ENTRY_TYPES.has(normalizedType)) {
+    return false;
+  }
+
+  return true;
+};
+
+const recalculateCustomerBalances = async (connection, customerId) => {
+  const [rows] = await connection.query(
+    `SELECT entry_id, debit_amount, credit_amount
+     FROM ledger_entries
+     WHERE customer_id = ?
+     ORDER BY entry_date ASC, sequence ASC, entry_id ASC`,
+    [customerId]
+  );
+
+  let runningBalance = 0;
+  for (const row of rows) {
+    const debit = Number(row.debit_amount) || 0;
+    const credit = Number(row.credit_amount) || 0;
+    runningBalance += debit - credit;
+    await connection.query(
+      `UPDATE ledger_entries SET balance = ? WHERE entry_id = ?`,
+      [Number(runningBalance.toFixed(2)), row.entry_id]
+    );
+  }
+};
+
 // Helper function to calculate balance
 const calculateBalance = async (customerId, currentEntryId = null) => {
   try {
@@ -509,11 +578,21 @@ router.put('/entry/:entryId', async (req, res) => {
     
     const { entryId } = req.params;
     const {
+      entryDate,
       description,
+      billNo,
+      debitAmount,
+      creditAmount,
+      transactionType,
       status,
       dueDate,
       paymentMode,
-      chequeNo
+      chequeNo,
+      useLineItems,
+      mtr,
+      rate,
+      lineItems,
+      salesTaxRate
     } = req.body;
 
     // Fetch the current entry BEFORE update to compare status
@@ -525,24 +604,131 @@ router.put('/entry/:entryId', async (req, res) => {
       return res.status(404).json({ error: 'Ledger entry not found' });
     }
     const currentEntry = currentRows[0];
+    const canEditAmountAndType = await isStandaloneManualEntry(connection, currentEntry);
+
+    const amountProvided = debitAmount !== undefined || creditAmount !== undefined || transactionType !== undefined;
+    if (amountProvided && !canEditAmountAndType) {
+      return res.status(403).json({
+        error: 'Only standalone manual entries can change amount or transaction type'
+      });
+    }
+
+    const normalizedTxType = String(transactionType || '').toLowerCase().trim();
+    const hasTransactionType = normalizedTxType === 'debit' || normalizedTxType === 'credit';
+    const parsedDebitAmount = Number(debitAmount);
+    const parsedCreditAmount = Number(creditAmount);
+
+    let nextDebit = Number(currentEntry.debit_amount) || 0;
+    let nextCredit = Number(currentEntry.credit_amount) || 0;
+
+    if (hasTransactionType) {
+      const amountForType = Number.isFinite(parsedDebitAmount)
+        ? parsedDebitAmount
+        : (Number.isFinite(parsedCreditAmount)
+          ? parsedCreditAmount
+          : Math.max(nextDebit, nextCredit, 0));
+
+      if (amountForType <= 0) {
+        return res.status(400).json({ error: 'Amount must be greater than zero when changing transaction type' });
+      }
+
+      if (normalizedTxType === 'debit') {
+        nextDebit = amountForType;
+        nextCredit = 0;
+      } else {
+        nextDebit = 0;
+        nextCredit = amountForType;
+      }
+    } else if (amountProvided) {
+      if (Number.isFinite(parsedDebitAmount) && Number.isFinite(parsedCreditAmount) && parsedDebitAmount > 0 && parsedCreditAmount > 0) {
+        return res.status(400).json({ error: 'Entry cannot have both debit and credit amounts at the same time' });
+      }
+
+      if (Number.isFinite(parsedDebitAmount)) {
+        nextDebit = Math.max(parsedDebitAmount, 0);
+      }
+      if (Number.isFinite(parsedCreditAmount)) {
+        nextCredit = Math.max(parsedCreditAmount, 0);
+      }
+
+      if (nextDebit > 0 && nextCredit > 0) {
+        return res.status(400).json({ error: 'Entry cannot have both debit and credit amounts at the same time' });
+      }
+      if (nextDebit <= 0 && nextCredit <= 0) {
+        return res.status(400).json({ error: 'Either debit amount or credit amount is required' });
+      }
+    }
+
     const wasUnpaid = currentEntry.status !== 'paid' && currentEntry.status !== 'Paid';
     const becomingPaid = status === 'paid' || status === 'Paid';
-    const isDebitEntry = parseFloat(currentEntry.debit_amount) > 0 && parseFloat(currentEntry.credit_amount) === 0;
+    const isDebitEntry = nextDebit > 0 && nextCredit === 0;
 
     // Update main entry
     await connection.query(
       `UPDATE ledger_entries 
-       SET description = ?, status = ?, due_date = ?, payment_mode = ?, cheque_no = ?
+       SET entry_date = ?, description = ?, bill_no = ?, debit_amount = ?, credit_amount = ?, status = ?, due_date = ?, payment_mode = ?, cheque_no = ?, sales_tax_rate = ?
        WHERE entry_id = ?`,
       [
-        description,
-        status,
+        entryDate || currentEntry.entry_date,
+        description ?? currentEntry.description,
+        billNo ?? currentEntry.bill_no,
+        nextDebit,
+        nextCredit,
+        status || currentEntry.status,
         dueDate || null,
-        paymentMode,
+        paymentMode || currentEntry.payment_mode || 'Cash',
         chequeNo || null,
+        Number(parseFloat(salesTaxRate) || currentEntry.sales_tax_rate || 0),
         entryId
       ]
     );
+
+    // Keep item details in sync when editing from General Ledger form
+    if (canEditAmountAndType) {
+      if (useLineItems === true && Array.isArray(lineItems) && lineItems.length > 0) {
+        await connection.query(`DELETE FROM ledger_line_items WHERE entry_id = ?`, [entryId]);
+        await connection.query(`DELETE FROM ledger_single_materials WHERE entry_id = ?`, [entryId]);
+        for (let i = 0; i < lineItems.length; i++) {
+          const item = lineItems[i];
+          const itemAmount = (parseFloat(item.quantity) || 0) * (parseFloat(item.rate) || 0);
+          const taxRate = parseFloat(item.taxRate) || 0;
+          const totalWithTax = itemAmount * (1 + taxRate / 100);
+          await connection.query(
+            `INSERT INTO ledger_line_items
+             (entry_id, description, quantity, rate, tax_rate, amount, total_with_tax, item_type, line_sequence)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+              entryId,
+              item.description || '',
+              parseFloat(item.quantity) || 0,
+              parseFloat(item.rate) || 0,
+              taxRate,
+              itemAmount,
+              totalWithTax,
+              item.type || 'material',
+              i + 1
+            ]
+          );
+        }
+        await connection.query(`UPDATE ledger_entries SET has_multiple_items = 1 WHERE entry_id = ?`, [entryId]);
+      } else if (useLineItems === false && (mtr !== undefined || rate !== undefined)) {
+        const qty = parseFloat(mtr) || 0;
+        const unitRate = parseFloat(rate) || 0;
+        const taxRate = Number(parseFloat(salesTaxRate) || currentEntry.sales_tax_rate || 0);
+        const amount = qty * unitRate;
+        const totalWithTax = amount * (1 + taxRate / 100);
+
+        await connection.query(`DELETE FROM ledger_line_items WHERE entry_id = ?`, [entryId]);
+        await connection.query(`DELETE FROM ledger_single_materials WHERE entry_id = ?`, [entryId]);
+        await connection.query(
+          `INSERT INTO ledger_single_materials
+           (entry_id, bill_no, quantity_mtr, rate, tax_rate, amount, total_with_tax)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [entryId, billNo ?? currentEntry.bill_no, qty, unitRate, taxRate, amount, totalWithTax]
+        );
+        await connection.query(`UPDATE ledger_entries SET has_multiple_items = 0 WHERE entry_id = ?`, [entryId]);
+      }
+    }
 
     // If a DEBIT entry just became 'paid', auto-create CREDIT payment entry
     // (mirrors how the invoice system works)
@@ -658,6 +844,8 @@ router.put('/entry/:entryId', async (req, res) => {
         }
       }
     }
+
+    await recalculateCustomerBalances(connection, currentEntry.customer_id);
 
     await connection.commit();
 
