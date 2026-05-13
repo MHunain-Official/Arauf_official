@@ -6,71 +6,6 @@ import { API_ENDPOINTS } from '../config/api';
 // import FinancialYearManager from './FinancialYearManager';
 
 const GeneralLedger = () => {
-  const NON_EDITABLE_LEDGER_TYPES = new Set([
-    'invoice',
-    'invoice_tax',
-    'po_invoice',
-    'po_invoice_tax',
-    'payment_tax'
-  ]);
-
-  const normalizeRefForLookup = (ref) => {
-    const value = String(ref || '').trim();
-    if (!value) return '';
-    return value.startsWith('TAX-') ? value.slice(4) : value;
-  };
-
-  const isStandaloneManualLedgerEntry = (entry, invoiceEntries = []) => {
-    if (!entry || !entry.entry_id || !entry.isManualEntry) return false;
-
-    const normalizedType = String(entry.entry_type || entry.entryType || '').toLowerCase().trim();
-    if (normalizedType && NON_EDITABLE_LEDGER_TYPES.has(normalizedType)) return false;
-
-    const rawRef = String(entry.billNo || entry.bill_no || '').trim();
-    const normalizedRef = normalizeRefForLookup(rawRef);
-    if (rawRef.startsWith('TAX-')) return false;
-    const desc = String(entry.description || entry.particulars || '').toLowerCase();
-    if (desc.includes('sales tax') || desc.includes('tax payment')) return false;
-    if (!normalizedRef || normalizedRef === '-') return true;
-
-    const linkedInvoiceExists = (invoiceEntries || []).some((row) => {
-      if (row?.isManualEntry) return false;
-      const candidate = normalizeRefForLookup(row.billNo || row.bill_no || row.invoiceId);
-      return candidate && candidate.toLowerCase() === normalizedRef.toLowerCase();
-    });
-    return !linkedInvoiceExists;
-  };
-
-  const isTaxLikeEntry = (entry) => {
-    const bill = String(entry?.billNo || entry?.bill_no || '').trim();
-    const desc = String(entry?.description || entry?.particulars || '').toLowerCase();
-    return bill.startsWith('TAX-') || desc.includes('sales tax') || desc.includes('tax payment');
-  };
-
-  const isPrimaryEditableRow = (entry, allEntries = []) => {
-    if (!entry?.canEdit) return false;
-    if (isTaxLikeEntry(entry)) return false;
-
-    const debit = parseFloat(entry.debit) || parseFloat(entry.debit_amount) || 0;
-    const credit = parseFloat(entry.credit) || parseFloat(entry.credit_amount) || 0;
-    if (debit > 0) return true;
-
-    if (credit > 0) {
-      const ref = normalizeRefForLookup(entry.billNo || entry.bill_no);
-      if (!ref) return true;
-      const hasDebitSibling = (allEntries || []).some((row) => {
-        if (!row?.canEdit) return false;
-        if (isTaxLikeEntry(row)) return false;
-        const rowRef = normalizeRefForLookup(row.billNo || row.bill_no);
-        const rowDebit = parseFloat(row.debit) || parseFloat(row.debit_amount) || 0;
-        return rowRef === ref && rowDebit > 0;
-      });
-      return !hasDebitSibling;
-    }
-
-    return false;
-  };
-
   const [activeTab, setActiveTab] = useState(null); // Will be set to first customer
   const [currentDate] = useState(new Date().toISOString().split('T')[0]);
   const [customers, setCustomers] = useState([]);
@@ -117,7 +52,6 @@ const GeneralLedger = () => {
     billNo: '',
     paymentMode: 'Cash',
     chequeNo: '',
-    dueDate: '',
     entryType: 'debit', // 'debit' or 'credit'
     salesTaxRate: 0,
     isPaid: true, // true = create both invoice+payment; false = invoice (pending) only
@@ -129,29 +63,8 @@ const GeneralLedger = () => {
   ]);
   const [useLineItems, setUseLineItems] = useState(false); // Toggle between old and new approach
   const [pendingMatchEntry, setPendingMatchEntry] = useState(null); // Pending debit entry matched by Bill #
-  const [editingEntryId, setEditingEntryId] = useState(null);
   const location = useLocation();
   const navigate = useNavigate();
-
-  const resetEntryForm = () => {
-    setEditingEntryId(null);
-    setNewEntry({
-      date: '',
-      particulars: '',
-      description: '',
-      mtr: '',
-      rate: '',
-      billNo: '',
-      paymentMode: 'Cash',
-      chequeNo: '',
-      dueDate: '',
-      entryType: 'debit',
-      salesTaxRate: 0,
-      isPaid: true,
-    });
-    setLineItems([{ id: 1, description: '', quantity: 0, rate: 0, type: 'material', amount: 0, taxRate: 0 }]);
-    setPendingMatchEntry(null);
-  };
 
   // Load settings from localStorage on mount
   useEffect(() => {
@@ -282,8 +195,7 @@ const GeneralLedger = () => {
                 taxAmount: parseFloat(entry.sales_tax_amount) || 0,
                 balance: parseFloat(entry.balance) || 0,
                 isManualEntry: true,  // Mark as manual entry so Edit/Delete buttons show
-                entry_id: entry.entry_id,  // Keep original ID for backend operations
-                entry_type: entry.entry_type || 'manual'
+                entry_id: entry.entry_id  // Keep original ID for backend operations
               }));
               console.log(`[GeneralLedger] ✅ Loaded ${manualEntries.length} manual ledger entries from database`);
               console.log(`[GeneralLedger] 📋 Mapped manual entries:`, manualEntries);
@@ -297,10 +209,7 @@ const GeneralLedger = () => {
         }
         
         // Combine both sources - invoices + manually added entries
-        const combinedEntries = [...invoices, ...manualEntries].map((entry) => ({
-          ...entry,
-          canEdit: isStandaloneManualLedgerEntry(entry, invoices)
-        }));
+        const combinedEntries = [...invoices, ...manualEntries];
         
         console.log(`[GeneralLedger] ✅ Received ${invoices.length} invoice entries + ${manualEntries.length} manual entries = ${combinedEntries.length} total for customer ${activeTab}`);
         console.log(`[GeneralLedger] 📋 Combined entries:`, combinedEntries);
@@ -335,14 +244,9 @@ const GeneralLedger = () => {
       setPendingMatchEntry(null);
       return;
     }
-    if (String(billNo).trim().toUpperCase().startsWith('TAX-')) {
-      setPendingMatchEntry(null);
-      return;
-    }
     const entries = ledgerData[activeTab] || [];
     const match = entries.find(entry => {
       const entryBillNo = String(entry.billNo || entry.bill_no || '').trim();
-      if (entryBillNo.toUpperCase().startsWith('TAX-')) return false;
       const debit = parseFloat(entry.debit) || parseFloat(entry.debit_amount) || 0;
       const credit = parseFloat(entry.credit) || parseFloat(entry.credit_amount) || 0;
       const status = String(entry.status || '').toLowerCase();
@@ -384,7 +288,20 @@ const GeneralLedger = () => {
       }
       alert('✅ Invoice marked as paid! A credit entry has been created automatically.');
       setPendingMatchEntry(null);
-      resetEntryForm();
+      setNewEntry({
+        date: '',
+        particulars: '',
+        description: '',
+        mtr: '',
+        rate: '',
+        billNo: '',
+        paymentMode: 'Cash',
+        chequeNo: '',
+        entryType: 'debit',
+        salesTaxRate: 0,
+        isPaid: true,
+      });
+      setLineItems([{ id: 1, description: '', quantity: 0, rate: 0, type: 'material', amount: 0, taxRate: 0 }]);
       setShowAddModal(false);
       setTimeout(() => window.location.reload(), 500);
     } catch (err) {
@@ -410,7 +327,7 @@ const GeneralLedger = () => {
 
     // Common fields
     const billNo = newEntry.billNo || null;
-    const entryDueDate = newEntry.dueDate || null;
+    const taxBillNo = billNo ? `TAX-${billNo}` : null;
     const entryDesc = newEntry.description || billNo || `Entry-${Date.now()}`;
 
     if (useLineItems) {
@@ -443,7 +360,8 @@ const GeneralLedger = () => {
         const amt = item.amount || ((Number(item.quantity) || 0) * (Number(item.rate) || 0));
         return sum + amt * (Number(item.taxRate) || 0) / 100;
       }, 0);
-      const effectiveTaxRate = totalFromItems > 0 ? Math.round((salesTaxAmount / totalFromItems) * 1000) / 10 : 0;
+      // Effective display rate (blended) for the tax entry label
+      const effectiveTaxRate = totalFromItems > 0 ? Math.round(salesTaxAmount / totalFromItems * 1000) / 10 : 0;
       const materialAmount = totalFromItems;
 
       // Derive description from line items when no overall description is provided
@@ -468,7 +386,7 @@ const GeneralLedger = () => {
         credit: 0,
         balance: 0,
         days: 0,
-        dueDate: entryDueDate,
+        dueDate: null,
         has_multiple_items: true,
         isManualEntry: true,
         _isTaxEntry: false,
@@ -502,10 +420,11 @@ const GeneralLedger = () => {
         });
       }
 
-      // Keep tax as separate entries using TAX-<Bill#>
+      // 3 & 4. Tax entries — if any line item has tax
       if (salesTaxAmount > 0) {
-        const taxBillNo = billNo ? `TAX-${billNo}` : null;
-        const taxLabel = `Sales Tax @ ${effectiveTaxRate > 0 ? effectiveTaxRate : 0}%`;
+        const taxLabel = effectiveTaxRate > 0 ? `Sales Tax @ ${effectiveTaxRate}%` : 'Sales Tax';
+        const taxPayLabel = effectiveTaxRate > 0 ? `Tax Payment @ ${effectiveTaxRate}%` : 'Tax Payment';
+        // DEBIT tax (always when tax exists)
         entriesToAdd.push({
           date: newEntry.date,
           particulars: taxLabel,
@@ -520,18 +439,18 @@ const GeneralLedger = () => {
           credit: 0,
           balance: 0,
           days: 0,
-          dueDate: entryDueDate,
+          dueDate: null,
           has_multiple_items: false,
           isManualEntry: true,
           _isTaxEntry: true,
           _hasLineItems: false,
         });
-
+        // CREDIT tax payment — only when isPaidTx
         if (isPaidTx) {
           entriesToAdd.push({
             date: newEntry.date,
-            particulars: `Tax Payment @ ${effectiveTaxRate > 0 ? effectiveTaxRate : 0}%`,
-            description: `Tax Payment @ ${effectiveTaxRate > 0 ? effectiveTaxRate : 0}%`,
+            particulars: taxPayLabel,
+            description: taxPayLabel,
             itemsDetails: null,
             mtr: null,
             rate: null,
@@ -566,6 +485,7 @@ const GeneralLedger = () => {
       const materialAmount = (Number(newEntry.mtr) || 0) * (Number(newEntry.rate) || 0);
       const salesTaxAmount = (materialAmount * salesTaxRate) / 100;
 
+      // 1. DEBIT entry (Invoice/Sale) — always created
       const debitDesc = isDebit ? entryDesc : `Invoice - ${entryDesc}`;
       entriesToAdd.push({
         date: newEntry.date,
@@ -580,13 +500,14 @@ const GeneralLedger = () => {
         credit: 0,
         balance: 0,
         days: 0,
-        dueDate: entryDueDate,
+        dueDate: null,
         has_multiple_items: false,
         isManualEntry: true,
         _isTaxEntry: false,
         _hasLineItems: false,
       });
 
+      // 2. CREDIT entry (Payment Received) — created only when isPaidTx
       if (isPaidTx) {
         const creditDesc = isDebit ? 'Payment Received' : entryDesc;
         entriesToAdd.push({
@@ -612,8 +533,9 @@ const GeneralLedger = () => {
         });
       }
 
-      if (salesTaxAmount > 0) {
-        const taxBillNo = billNo ? `TAX-${billNo}` : null;
+      // 3 & 4. Tax entries — if tax applied
+      if (salesTaxRate > 0) {
+        // DEBIT tax (always when tax exists)
         entriesToAdd.push({
           date: newEntry.date,
           particulars: `Sales Tax @ ${salesTaxRate}%`,
@@ -627,12 +549,13 @@ const GeneralLedger = () => {
           credit: 0,
           balance: 0,
           days: 0,
-          dueDate: entryDueDate,
+          dueDate: null,
           has_multiple_items: false,
           isManualEntry: true,
           _isTaxEntry: true,
           _hasLineItems: false,
         });
+        // CREDIT tax payment — only when isPaidTx
         if (isPaidTx) {
           entriesToAdd.push({
             date: newEntry.date,
@@ -681,7 +604,6 @@ const GeneralLedger = () => {
           entryDate: entry.date,
           description: entry.particulars,
           billNo: entry.billNo,
-          entryType: isTaxEntry ? 'manual_tax' : (entry.debit > 0 ? 'manual' : 'payment'),
           paymentMode: newEntry.paymentMode,
           chequeNo: entry.chequeNo,
           debitAmount: entry.debit,
@@ -745,7 +667,23 @@ const GeneralLedger = () => {
     }));
 
     // Reset form and close modal
-    resetEntryForm();
+    setNewEntry({
+      date: '',
+      particulars: '',
+      description: '',
+      mtr: '',
+      rate: '',
+      billNo: '',
+      paymentMode: 'Cash',
+      chequeNo: '',
+      entryType: 'debit',
+      salesTaxRate: 0,
+      isPaid: true,
+    });
+
+    // Reset line items when leaving modal
+    setLineItems([{ id: 1, description: '', quantity: 0, rate: 0, type: 'material', amount: 0, taxRate: 0 }]);
+    setPendingMatchEntry(null);
     setShowAddModal(false);
 
     // Auto-refresh ledger data after 500ms to show the new entry
@@ -981,19 +919,19 @@ const GeneralLedger = () => {
   };
 
   // Handle delete entry and recalculate balances for subsequent entries
-  const handleDeleteEntry = async (entryToDelete) => {
+  const handleDeleteEntry = async (indexToDelete) => {
     if (!window.confirm('Are you sure you want to delete this entry? This cannot be undone.')) return;
 
     try {
       const currentEntries = ledgerData[activeTab] || [];
-      const deleteEntryId = entryToDelete?.entry_id;
+      const entryToDelete = currentEntries[indexToDelete];
 
       // Only delete from backend if it's a manual entry with an entry_id
-      if (entryToDelete?.isManualEntry && deleteEntryId) {
-        console.log(`[GeneralLedger] 🗑️ Deleting entry_id=${deleteEntryId} from backend`);
+      if (entryToDelete.isManualEntry && entryToDelete.entry_id) {
+        console.log(`[GeneralLedger] 🗑️ Deleting entry_id=${entryToDelete.entry_id} from backend`);
         
         const deleteResponse = await fetch(
-          `${process.env.REACT_APP_API_BASE_URL || 'http://localhost:5000/api'}/ledger-entries/entry/${deleteEntryId}`,
+          `${process.env.REACT_APP_API_BASE_URL || 'http://localhost:5000/api'}/ledger-entries/entry/${entryToDelete.entry_id}`,
           { method: 'DELETE' }
         );
 
@@ -1006,11 +944,11 @@ const GeneralLedger = () => {
       }
 
       // Remove from local state
-      const newEntries = currentEntries.filter((item) => String(item.entry_id || '') !== String(deleteEntryId || ''));
+      const newEntries = currentEntries.filter((_, idx) => idx !== indexToDelete);
 
       // Recalculate balances from the deletion point onwards
-      let runningBalance = 0;
-      for (let i = 0; i < newEntries.length; i++) {
+      let runningBalance = indexToDelete > 0 ? (parseFloat(newEntries[indexToDelete - 1]?.balance) || 0) : 0;
+      for (let i = indexToDelete; i < newEntries.length; i++) {
         const entry = newEntries[i];
         const debit = parseFloat(entry._displayDebit) || parseFloat(entry.debit) || 0;
         const credit = parseFloat(entry._displayCredit) || parseFloat(entry.credit) || 0;
@@ -1053,176 +991,10 @@ const GeneralLedger = () => {
     }
   };
 
-  const openEditInAddForm = async (entry) => {
-    if (!entry?.entry_id) {
-      alert('This entry cannot be edited.');
-      return;
-    }
-    const entryBillNo = String(entry.billNo || entry.bill_no || '').trim();
-    if (entryBillNo.toUpperCase().startsWith('TAX-')) {
-      alert('Tax references (TAX-) cannot be edited from New Ledger Entry form.');
-      return;
-    }
-
-    const billNo = (entry.billNo || entry.bill_no || '') === '-' ? '' : (entry.billNo || entry.bill_no || '');
-    const normalizedBill = normalizeRefForLookup(billNo);
-    const related = (ledgerData[activeTab] || []).filter((row) => {
-      if (!row?.entry_id || !row?.isManualEntry) return false;
-      return normalizeRefForLookup(row.billNo || row.bill_no) === normalizedBill;
-    });
-    const hasCreditSibling = related.some((row) => (parseFloat(row.credit) || parseFloat(row.credit_amount) || 0) > 0);
-
-    let detailEntry = entry;
-    try {
-      const response = await fetch(`${process.env.REACT_APP_API_BASE_URL || 'http://localhost:5000/api'}/ledger-entries/entry/${entry.entry_id}`);
-      if (response.ok) {
-        const payload = await response.json();
-        if (payload?.success && payload?.data) {
-          detailEntry = { ...entry, ...payload.data };
-        }
-      }
-    } catch (e) {
-      console.warn('[GeneralLedger] Failed to fetch detailed entry for edit:', e.message);
-    }
-
-    const debit = parseFloat(detailEntry.debit) || parseFloat(detailEntry.debit_amount) || 0;
-    const credit = parseFloat(detailEntry.credit) || parseFloat(detailEntry.credit_amount) || 0;
-    const amount = debit > 0 ? debit : credit;
-    const qty = parseFloat(detailEntry.mtr ?? detailEntry.quantity_mtr) || 0;
-    const rate = parseFloat(detailEntry.rate) || 0;
-    const amountWithoutTax = qty > 0 && rate > 0 ? qty * rate : amount;
-    const taxRate = parseFloat(detailEntry.taxRate ?? detailEntry.sales_tax_rate) || 0;
-
-    setEditingEntryId(entry.entry_id);
-    setUseLineItems(Boolean(detailEntry.has_multiple_items && Array.isArray(detailEntry.lineItems) && detailEntry.lineItems.length > 0));
-    if (detailEntry.has_multiple_items && Array.isArray(detailEntry.lineItems) && detailEntry.lineItems.length > 0) {
-      setLineItems(detailEntry.lineItems.map((item, idx) => ({
-        id: idx + 1,
-        description: item.description || '',
-        quantity: Number(item.quantity) || 0,
-        rate: Number(item.rate) || 0,
-        type: item.item_type || item.type || 'material',
-        amount: Number(item.amount) || ((Number(item.quantity) || 0) * (Number(item.rate) || 0)),
-        taxRate: Number(item.tax_rate ?? item.taxRate) || 0
-      })));
-    }
-    setNewEntry({
-      date: detailEntry.entry_date ? String(detailEntry.entry_date).split('T')[0] : (detailEntry.date ? String(detailEntry.date).split('T')[0] : ''),
-      particulars: detailEntry.particulars || '',
-      description: detailEntry.description || detailEntry.particulars || '',
-      mtr: qty > 0 ? qty : '',
-      rate: rate > 0 ? rate : '',
-      billNo,
-      paymentMode: detailEntry.payment_mode || detailEntry.paymentMode || 'Cash',
-      chequeNo: detailEntry.cheque_no || detailEntry.chequeNo || '',
-      dueDate: detailEntry.due_date || detailEntry.dueDate || '',
-      entryType: debit >= credit ? 'debit' : 'credit',
-      salesTaxRate: taxRate > 0 ? taxRate : (amountWithoutTax > 0 ? (((amount - amountWithoutTax) / amountWithoutTax) * 100).toFixed(2) : 0),
-      isPaid: hasCreditSibling
-    });
-    setShowAddModal(true);
-  };
-
-  const handleEditEntry = (entryToEdit) => {
-    if (!entryToEdit || !isPrimaryEditableRow(entryToEdit, ledgerData[activeTab] || [])) {
-      alert('Please click Edit on the main DEBIT entry. Linked payment/tax rows update automatically.');
-      return;
-    }
-
-    openEditInAddForm(entryToEdit);
-  };
-
-  const handleUpdateEntry = async () => {
-    if (!editingEntryId) return;
-    if (!newEntry.date) {
-      alert('Please select an Entry Date');
-      return;
-    }
-
-    let subtotalAmount = 0;
-    let taxAmount = 0;
-    if (useLineItems) {
-      subtotalAmount = getLineItemsTotal();
-      taxAmount = lineItems.reduce((sum, item) => {
-        const amt = item.amount || ((Number(item.quantity) || 0) * (Number(item.rate) || 0));
-        return sum + (amt * (Number(item.taxRate) || 0) / 100);
-      }, 0);
-    } else {
-      if (!newEntry.mtr || Number(newEntry.mtr) <= 0 || !newEntry.rate || Number(newEntry.rate) <= 0) {
-        alert('Please enter valid quantity and rate');
-        return;
-      }
-      subtotalAmount = (Number(newEntry.mtr) || 0) * (Number(newEntry.rate) || 0);
-      taxAmount = (subtotalAmount * (Number(newEntry.salesTaxRate) || 0)) / 100;
-    }
-
-      const ref = normalizeRefForLookup(newEntry.billNo);
-    const candidates = (ledgerData[activeTab] || []).filter((row) => {
-      if (!row?.entry_id || !row?.isManualEntry) return false;
-      if (ref) return normalizeRefForLookup(row.billNo || row.bill_no) === ref;
-      return String(row.entry_id) === String(editingEntryId);
-    });
-    const targets = candidates.length > 0 ? candidates : (ledgerData[activeTab] || []).filter((row) => String(row.entry_id) === String(editingEntryId));
-
-    try {
-      for (const row of targets) {
-        const rowBill = String(row.billNo || row.bill_no || '');
-        const isTaxRow = rowBill.startsWith('TAX-') || isTaxLikeEntry(row);
-        const existingDebit = parseFloat(row.debit) || parseFloat(row.debit_amount) || 0;
-        const existingCredit = parseFloat(row.credit) || parseFloat(row.credit_amount) || 0; 
-        const isCreditRow = existingCredit > 0 && existingDebit === 0;
-        const txType = targets.length === 1 ? newEntry.entryType : (existingDebit > 0 ? 'debit' : 'credit');
-        const rowAmount = isTaxRow ? taxAmount : subtotalAmount;
-        if (rowAmount <= 0) continue;
-
-        const response = await fetch(
-          `${process.env.REACT_APP_API_BASE_URL || 'http://localhost:5000/api'}/ledger-entries/entry/${row.entry_id}`,
-          {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              entryDate: newEntry.date,
-              description: isTaxRow
-                ? (isCreditRow ? `Tax Payment @ ${newEntry.salesTaxRate || 0}%` : `Sales Tax @ ${newEntry.salesTaxRate || 0}%`)
-                : (txType === 'credit' ? (row.particulars || row.description || 'Payment Received') : (newEntry.description || row.particulars || row.description || '')),
-              billNo: rowBill || null, // locked in edit mode
-              transactionType: txType,
-              debitAmount: rowAmount,
-              creditAmount: rowAmount,
-              useLineItems: !isTaxRow && !!useLineItems,
-              mtr: !isTaxRow && !useLineItems ? Number(newEntry.mtr || 0) : null,
-              rate: !isTaxRow && !useLineItems ? Number(newEntry.rate || 0) : null,
-              lineItems: !isTaxRow && useLineItems
-                ? lineItems.map(item => ({
-                    description: item.description,
-                    quantity: Number(item.quantity) || 0,
-                    rate: Number(item.rate) || 0,
-                    type: item.type || 'material',
-                    taxRate: Number(item.taxRate) || 0
-                  }))
-                : undefined,
-              salesTaxRate: Number(newEntry.salesTaxRate || 0),
-              dueDate: row.due_date || row.dueDate || null,
-              status: row.status || 'unpaid', // locked in edit mode
-              paymentMode: row.payment_mode || row.paymentMode || 'Cash', // locked in edit mode
-              chequeNo: row.cheque_no || row.chequeNo || null // locked in edit mode
-            })
-          }
-        );
-        if (!response.ok) {
-          const errData = await response.json().catch(() => ({}));
-          throw new Error(errData.error || 'Failed to update entry');
-        }
-      }
-
-      alert('✅ Entry updated successfully!');
-      setShowAddModal(false);
-      resetEntryForm();
-      setTimeout(() => window.location.reload(), 300);
-    } catch (err) {
-      console.error('[GeneralLedger] ❌ Error updating entry:', err);
-      alert(`⚠️ Error updating entry: ${err.message}`);
-    }
+  // Handle edit entry (for future use - opens modal with entry data)
+  const handleEditEntry = (indexToEdit) => {
+    alert('Edit feature coming soon!');
+    // TODO: Populate modal with entry data and allow editing
   };
 
   const getDaysColor = (days) => {
@@ -1653,7 +1425,6 @@ const GeneralLedger = () => {
                   {isTableExpanded && (
                     <th className="px-6 py-4 text-center font-bold text-white whitespace-nowrap text-xs uppercase tracking-wider">Days</th>
                   )}
-                  <th className="px-6 py-4 text-center font-bold text-white whitespace-nowrap text-xs uppercase tracking-wider">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-200">
@@ -1794,45 +1565,13 @@ const GeneralLedger = () => {
                         </td>
                       )}
                       
-                      <td className="px-6 py-4">
-                        {(() => {
-                          const canPrimaryEdit = isPrimaryEditableRow(entry, ledgerData[activeTab] || []);
-                          return (
-                        <div className="flex items-center justify-center gap-2">
-                          <button
-                            onClick={() => handleEditEntry(entry)}
-                            disabled={!canPrimaryEdit}
-                            className={`px-3 py-1.5 rounded text-xs font-semibold transition-all ${
-                              canPrimaryEdit
-                                ? 'bg-blue-100 text-blue-700 hover:bg-blue-200'
-                                : 'bg-slate-100 text-slate-400 cursor-not-allowed'
-                            }`}
-                            title={canPrimaryEdit ? 'Edit entry' : 'Edit from the main debit row'}
-                          >
-                            Edit
-                          </button>
-                          <button
-                            onClick={() => handleDeleteEntry(entry)}
-                            disabled={!canPrimaryEdit}
-                            className={`px-3 py-1.5 rounded text-xs font-semibold transition-all ${
-                              canPrimaryEdit
-                                ? 'bg-red-100 text-red-700 hover:bg-red-200'
-                                : 'bg-slate-100 text-slate-400 cursor-not-allowed'
-                            }`}
-                            title={canPrimaryEdit ? 'Delete entry' : 'Delete from the main debit row'}
-                          >
-                            Delete
-                          </button>
-                        </div>
-                          );
-                        })()}
-                      </td>
+                      {/* Actions column removed as requested */}
                     </tr>
                     );
                   })
                 ) : (
                   <tr>
-                    <td colSpan="14" className="px-6 py-16 text-center">
+                    <td colSpan="13" className="px-6 py-16 text-center">
                       <svg className="w-16 h-16 mx-auto mb-4 opacity-30 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
                       </svg>
@@ -1864,11 +1603,11 @@ const GeneralLedger = () => {
               {/* Header */}
               <div className="sticky top-0 bg-gradient-to-r from-slate-900 via-slate-800 to-slate-900 px-8 py-6 flex items-center justify-between border-b border-slate-700">
                 <div>
-                  <h2 className="text-2xl font-bold text-white">{editingEntryId ? 'Edit Ledger Entry' : 'New Ledger Entry'}</h2>
-                  <p className="text-slate-400 text-sm mt-1">{editingEntryId ? 'Update existing transaction' : 'Record a new transaction'}</p>
+                  <h2 className="text-2xl font-bold text-white">New Ledger Entry</h2>
+                  <p className="text-slate-400 text-sm mt-1">Record a new transaction</p>
                 </div>
                 <button
-                  onClick={() => { setShowAddModal(false); resetEntryForm(); }}
+                  onClick={() => { setShowAddModal(false); setPendingMatchEntry(null); }}
                   className="w-9 h-9 rounded-lg bg-slate-700 hover:bg-slate-600 flex items-center justify-center text-slate-300 hover:text-white transition-all"
                 >
                   <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -1888,7 +1627,6 @@ const GeneralLedger = () => {
                   <div className="grid grid-cols-2 gap-4">
                     <button
                       onClick={() => {
-                        if (editingEntryId) return;
                         setUseLineItems(false);
                         setLineItems([{ id: 1, description: '', quantity: 0, rate: 0, type: 'material', amount: 0 }]);
                       }}
@@ -1903,7 +1641,6 @@ const GeneralLedger = () => {
                     </button>
                     <button
                       onClick={() => {
-                        if (editingEntryId) return;
                         setUseLineItems(true);
                         setLineItems([{ id: 1, description: '', quantity: 0, rate: 0, type: 'material', amount: 0 }]);
                       }}
@@ -1922,7 +1659,7 @@ const GeneralLedger = () => {
                 {/* Basic Info Section */}
                 <div className="bg-slate-50 rounded-lg p-6 mb-6 border border-slate-200">
                   <h3 className="text-sm font-bold text-slate-900 mb-4 uppercase tracking-wider">Transaction Details</h3>
-                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                     <div>
                       <label className="block text-sm font-semibold text-slate-700 mb-2">Date</label>
                       <input
@@ -1933,36 +1670,16 @@ const GeneralLedger = () => {
                       />
                     </div>
                     <div>
-                      <label className="block text-sm font-semibold text-slate-700 mb-2">Invoice Number</label>
+                      <label className="block text-sm font-semibold text-slate-700 mb-2">Bill #</label>
                       <input
                         type="text"
-                        placeholder="INV-1001 / REF-01"
+                        placeholder="INV-1001"
                         value={newEntry.billNo}
                         onChange={(e) => {
-                          if (editingEntryId) return;
                           setNewEntry({ ...newEntry, billNo: e.target.value });
                           lookupPendingEntry(e.target.value);
                         }}
-                        disabled={!!editingEntryId}
-                        className={`w-full px-4 py-2.5 rounded-lg border border-slate-300 transition-all font-medium ${
-                          editingEntryId
-                            ? 'bg-slate-100 text-slate-500 cursor-not-allowed'
-                            : 'focus:border-blue-500 focus:ring-2 focus:ring-blue-100 text-slate-900 bg-white placeholder-slate-400'
-                        }`}
-                      />
-                    </div>
-                    <div>
-                      <label className="block text-sm font-semibold text-slate-700 mb-2">Payment Deadline</label>
-                      <input
-                        type="date"
-                        value={newEntry.dueDate || ''}
-                        onChange={(e) => setNewEntry({ ...newEntry, dueDate: e.target.value })}
-                        disabled={!!editingEntryId}
-                        className={`w-full px-4 py-2.5 rounded-lg border border-slate-300 transition-all font-medium ${
-                          editingEntryId
-                            ? 'bg-slate-100 text-slate-500 cursor-not-allowed'
-                            : 'focus:border-blue-500 focus:ring-2 focus:ring-blue-100 text-slate-900 bg-white'
-                        }`}
+                        className="w-full px-4 py-2.5 rounded-lg border border-slate-300 focus:border-blue-500 focus:ring-2 focus:ring-blue-100 transition-all font-medium text-slate-900 bg-white placeholder-slate-400"
                       />
                     </div>
                   </div>
@@ -2141,22 +1858,16 @@ const GeneralLedger = () => {
 
                       <div className="grid grid-cols-1 md:grid-cols-6 gap-4">
                         <div className="md:col-span-1">
-                          <label className="block text-xs font-semibold text-slate-700 mb-1.5 uppercase">Invoice Number</label>
+                          <label className="block text-xs font-semibold text-slate-700 mb-1.5 uppercase">Bill #</label>
                           <input
                             type="text"
                             placeholder="INV-1001"
                             value={newEntry.billNo}
                             onChange={(e) => {
-                              if (editingEntryId) return;
                               setNewEntry({ ...newEntry, billNo: e.target.value });
                               lookupPendingEntry(e.target.value);
                             }}
-                            disabled={!!editingEntryId}
-                            className={`w-full px-3 py-2 border border-slate-300 rounded text-sm font-medium transition-all ${
-                              editingEntryId
-                                ? 'bg-slate-100 text-slate-500 cursor-not-allowed'
-                                : 'bg-white text-slate-900 focus:border-blue-500 focus:ring-2 focus:ring-blue-100'
-                            }`}
+                            className="w-full px-3 py-2 border border-slate-300 rounded bg-white text-slate-900 text-sm font-medium focus:border-blue-500 focus:ring-2 focus:ring-blue-100 transition-all"
                           />
                         </div>
                         <div>
@@ -2209,17 +1920,13 @@ const GeneralLedger = () => {
                 {/* Transaction Type Section */}
                 <div className="bg-slate-50 rounded-lg p-6 mb-6 border border-slate-200">
                   <h3 className="text-sm font-bold text-slate-900 mb-4 uppercase tracking-wider">Transaction Type</h3>
-                  {editingEntryId && (
-                    <p className="text-xs text-slate-500 mb-3">Locked in edit mode. You can only change Date and Material Details.</p>
-                  )}
                   <div className="space-y-3">
                     <label className="flex items-center cursor-pointer p-3 rounded-lg hover:bg-white transition-all border-2 border-transparent hover:border-red-200" 
-                      onClick={() => { if (!editingEntryId) setNewEntry({ ...newEntry, entryType: 'debit' }); }}>
+                      onClick={() => setNewEntry({ ...newEntry, entryType: 'debit' })}>
                       <input
                         type="checkbox"
                         checked={newEntry.entryType === 'debit'}
-                        onChange={() => { if (!editingEntryId) setNewEntry({ ...newEntry, entryType: 'debit' }); }}
-                        disabled={!!editingEntryId}
+                        onChange={() => setNewEntry({ ...newEntry, entryType: 'debit' })}
                         className="w-5 h-5 rounded border-slate-300 text-red-600 cursor-pointer"
                       />
                       <div className="ml-3">
@@ -2228,12 +1935,11 @@ const GeneralLedger = () => {
                       </div>
                     </label>
                     <label className="flex items-center cursor-pointer p-3 rounded-lg hover:bg-white transition-all border-2 border-transparent hover:border-green-200" 
-                      onClick={() => { if (!editingEntryId) setNewEntry({ ...newEntry, entryType: 'credit' }); }}>
+                      onClick={() => setNewEntry({ ...newEntry, entryType: 'credit' })}>
                       <input
                         type="checkbox"
                         checked={newEntry.entryType === 'credit'}
-                        onChange={() => { if (!editingEntryId) setNewEntry({ ...newEntry, entryType: 'credit' }); }}
-                        disabled={!!editingEntryId}
+                        onChange={() => setNewEntry({ ...newEntry, entryType: 'credit' })}
                         className="w-5 h-5 rounded border-slate-300 text-green-600 cursor-pointer"
                       />
                       <div className="ml-3">
@@ -2253,8 +1959,7 @@ const GeneralLedger = () => {
                             type="radio"
                             name="isPaid"
                             checked={newEntry.isPaid !== false}
-                            onChange={() => { if (!editingEntryId) setNewEntry({ ...newEntry, isPaid: true }); }}
-                            disabled={!!editingEntryId}
+                            onChange={() => setNewEntry({ ...newEntry, isPaid: true })}
                             className="w-4 h-4 text-green-600"
                           />
                           <span className="text-sm font-semibold text-green-700">💰 Paid — creates invoice + payment</span>
@@ -2264,8 +1969,7 @@ const GeneralLedger = () => {
                             type="radio"
                             name="isPaid"
                             checked={newEntry.isPaid === false}
-                            onChange={() => { if (!editingEntryId) setNewEntry({ ...newEntry, isPaid: false }); }}
-                            disabled={!!editingEntryId}
+                            onChange={() => setNewEntry({ ...newEntry, isPaid: false })}
                             className="w-4 h-4 text-amber-600"
                           />
                           <span className="text-sm font-semibold text-amber-700">📋 Pending — invoice only (unpaid)</span>
@@ -2284,7 +1988,6 @@ const GeneralLedger = () => {
                       <select
                         value={newEntry.paymentMode || 'Cash'}
                         onChange={(e) => {
-                          if (editingEntryId) return;
                           const mode = e.target.value;
                           setNewEntry({ 
                             ...newEntry, 
@@ -2292,10 +1995,7 @@ const GeneralLedger = () => {
                             chequeNo: (mode === 'Cheque' || mode === 'Online') ? newEntry.chequeNo : ''
                           });
                         }}
-                        disabled={!!editingEntryId}
-                        className={`w-full px-4 py-2.5 rounded-lg border-2 border-slate-300 transition-all font-medium ${
-                          editingEntryId ? 'bg-slate-100 text-slate-500 cursor-not-allowed' : 'focus:border-blue-500 focus:ring-2 focus:ring-blue-100 text-slate-900 bg-white'
-                        }`}
+                        className="w-full px-4 py-2.5 rounded-lg border-2 border-slate-300 focus:border-blue-500 focus:ring-2 focus:ring-blue-100 transition-all font-medium text-slate-900 bg-white"
                       >
                         <option value="Cash">💵 Cash - Direct Payment</option>
                         <option value="Online">🌐 Online - Bank Transfer</option>
@@ -2312,15 +2012,11 @@ const GeneralLedger = () => {
                           placeholder="e.g., 12345"
                           value={newEntry.chequeNo || ''}
                           onChange={(e) => {
-                            if (editingEntryId) return;
                             const value = e.target.value.replace(/\D/g, '').slice(0, 5);
                             setNewEntry({ ...newEntry, chequeNo: value });
                           }}
                           maxLength="5"
-                          disabled={!!editingEntryId}
-                          className={`w-full px-4 py-2.5 rounded-lg border-2 border-slate-300 transition-all font-medium ${
-                            editingEntryId ? 'bg-slate-100 text-slate-500 cursor-not-allowed' : 'focus:border-blue-500 focus:ring-2 focus:ring-blue-100 text-slate-900 bg-white placeholder-slate-400'
-                          }`}
+                          className="w-full px-4 py-2.5 rounded-lg border-2 border-slate-300 focus:border-blue-500 focus:ring-2 focus:ring-blue-100 transition-all font-medium text-slate-900 bg-white placeholder-slate-400"
                         />
                       </div>
                     )}
@@ -2331,23 +2027,12 @@ const GeneralLedger = () => {
               {/* Footer */}
               <div className="sticky bottom-0 bg-slate-50 border-t border-slate-200 px-8 py-4 flex justify-end gap-3">
                 <button
-                  onClick={() => { setShowAddModal(false); resetEntryForm(); }}
+                  onClick={() => { setShowAddModal(false); setPendingMatchEntry(null); }}
                   className="px-6 py-2.5 rounded-lg bg-slate-200 hover:bg-slate-300 text-slate-900 font-semibold transition-all"
                 >
                   Cancel
                 </button>
-                {!editingEntryId && pendingMatchEntry && (
-                  <button
-                    onClick={() => openEditInAddForm(pendingMatchEntry)}
-                    className="px-6 py-2.5 rounded-lg bg-gradient-to-r from-indigo-500 to-indigo-600 hover:from-indigo-600 hover:to-indigo-700 text-white font-semibold transition-all shadow-md hover:shadow-lg flex items-center gap-2"
-                  >
-                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
-                    </svg>
-                    Edit Matched Entry
-                  </button>
-                )}
-                {!editingEntryId && pendingMatchEntry && (
+                {pendingMatchEntry && (
                   <button
                     onClick={handleMarkAsPaid}
                     className="px-6 py-2.5 rounded-lg bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-600 hover:to-amber-700 text-white font-semibold transition-all shadow-md hover:shadow-lg flex items-center gap-2"
@@ -2359,13 +2044,13 @@ const GeneralLedger = () => {
                   </button>
                 )}
                 <button
-                  onClick={editingEntryId ? handleUpdateEntry : handleAddEntry}
+                  onClick={handleAddEntry}
                   className="px-6 py-2.5 rounded-lg bg-gradient-to-r from-blue-600 to-blue-700 hover:from-blue-700 hover:to-blue-800 text-white font-semibold transition-all shadow-md hover:shadow-lg flex items-center gap-2"
                 >
                   <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M12 4v16m8-8H4" />
                   </svg>
-                  {editingEntryId ? 'Save Changes' : 'Add Entry'}
+                  Add Entry
                 </button>
               </div>
             </div>
